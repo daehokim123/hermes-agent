@@ -5,12 +5,31 @@ import { createGatewayEventHandler } from '../app/createGatewayEventHandler.js'
 import { getOverlayState, resetOverlayState } from '../app/overlayStore.js'
 import { patchUiState, resetUiState } from '../app/uiStore.js'
 
-beforeEach(() => { resetOverlayState(); resetUiState() })
+beforeEach(() => {
+  resetOverlayState()
+  resetUiState()
+})
 it('rejects foreign/no-active session approvals and preserves exact accepted identity', () => {
-  const onEvent = createGatewayEventHandler({ composer: {}, gateway: {}, session: {}, submission: {}, system: {}, transcript: {}, voice: {} } as any)
-  const event = { type: 'approval.request', session_id: 'focused', payload: {
-    request_id: 'exact-request', command: 'sensitive-command', description: 'sensitive-description'
-  } } as any
+  const onEvent = createGatewayEventHandler({
+    composer: {},
+    gateway: {},
+    session: {},
+    submission: {},
+    system: {},
+    transcript: {},
+    voice: {}
+  } as any)
+
+  const event = {
+    type: 'approval.request',
+    session_id: 'focused',
+    payload: {
+      request_id: 'exact-request',
+      command: 'sensitive-command',
+      description: 'sensitive-description'
+    }
+  } as any
+
   onEvent(event)
   expect(getOverlayState().approval).toBeNull()
   patchUiState({ sid: 'other' })
