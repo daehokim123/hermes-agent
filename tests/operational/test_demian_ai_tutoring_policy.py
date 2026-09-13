@@ -105,7 +105,10 @@ def test_demian_prompt_sources_point_to_single_tutoring_contract(role):
 @pytest.mark.parametrize('role', ('default', 'demian'))
 def test_default_context_cap_keeps_full_assembled_tutoring(tmp_path, monkeypatch, role):
     assembler = _assembler()
-    target = assembler.materialize(ROOT, role, tmp_path / role)
+    evidence_root = tmp_path / 'evidence'
+    evidence_root.mkdir()
+    monkeypatch.setattr(assembler, 'EVIDENCE_ROOT', evidence_root)
+    target = assembler.materialize(ROOT, role, evidence_root / role)
     monkeypatch.setenv('HERMES_HOME', str(target))
     result = assembler.verify_native(ROOT, role, target)
     assert result['truncated'] is False
