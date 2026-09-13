@@ -6,7 +6,6 @@ import { DASHBOARD_TUI_MODE } from '../config/env.js'
 import { DOUBLE_ESC_MS, TYPING_IDLE_MS } from '../config/timing.js'
 import { applyCompletion } from '../domain/slash.js'
 import type {
-  ApprovalRespondResponse,
   ConfigSetResponse,
   SecretRespondResponse,
   SudoRespondResponse,
@@ -18,6 +17,7 @@ import { computeWheelStep, initWheelAccelForHost } from '../lib/wheelAccel.js'
 import { closeWidget, dispatchWidgetInput } from '../sdk/host.js'
 
 import { $agentDockCollapsed } from './agentRoster.js'
+import { respondToApproval } from './approvalResponse.js'
 import { getInputSelection } from './inputSelectionStore.js'
 import {
   type GatewayRpc,
@@ -228,9 +228,7 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
     }
 
     if (overlay.approval) {
-      return gateway
-        .rpc<ApprovalRespondResponse>('approval.respond', { choice: 'deny', session_id: getUiState().sid })
-        .then(r => r && (patchOverlayState({ approval: null }), patchTurnState({ outcome: 'denied' })))
+      return respondToApproval(gateway.rpc, 'deny')
     }
 
     if (overlay.sudo || overlay.secret || overlay.vaultUnlock) {

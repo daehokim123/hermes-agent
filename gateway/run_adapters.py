@@ -1032,7 +1032,7 @@ class GatewayAdapterLifecycleMixin:
     def _wire_adapter_handlers(
         self, adapter: BasePlatformAdapter, *, message_handler=None, fatal_error_handler=None,
         busy_session_handler=None, authorization_check=None, platform_event_handler=None,
-        busy_text_mode: Optional[str] = None,
+        busy_text_mode: Optional[str] = None, router_profile_home=None,
     ) -> None:
         """Install the runner callbacks every adapter needs (defaults = primary handlers;
         secondary wiring passes profile-scoped variants). ``set_reaction_handler`` is optional."""
@@ -1049,6 +1049,8 @@ class GatewayAdapterLifecycleMixin:
         )
         adapter.set_platform_event_handler(platform_event_handler or self._primary_platform_event_handler())
         adapter._busy_text_mode = (self._busy_text_mode if busy_text_mode is None else busy_text_mode)
+        from gateway.work_router.integration import attach_adapter
+        attach_adapter(self, adapter, profile_home=router_profile_home)
 
     def _configure_profile_adapter(
         self, adapter: BasePlatformAdapter, profile_name: str, platform: Platform
@@ -1064,8 +1066,10 @@ class GatewayAdapterLifecycleMixin:
         # Voice transcripts from this bot's channels dispatch through THIS adapter (primary wiring lives at
         # connect time; see #75198).
         text_modes = getattr(self, "_busy_text_modes_by_profile", None)
+        from hermes_cli.profiles import get_profile_dir
         self._wire_adapter_handlers(
             adapter,
+            router_profile_home=get_profile_dir(profile_name),
             message_handler=self._make_profile_message_handler(profile_name),
             fatal_error_handler=self._make_profile_fatal_error_handler(profile_name, platform),
             busy_session_handler=self._make_profile_busy_session_handler(profile_name),
@@ -1475,7 +1479,7 @@ class GatewayAdapterLifecycleMixin:
 
         def check(
             user_id: str, chat_type: Optional[str] = None, chat_id: Optional[str] = None, *,
-            is_bot: bool = False, thread_id: Optional[str] = None, command: Optional[str] = None,
+            is_bot: bool = False, thread_id: Optional[str] = None,
         ) -> bool:
             if not user_id:
                 return False
@@ -1492,13 +1496,9 @@ class GatewayAdapterLifecycleMixin:
             if adapter is not None:
                 source._transport_adapter_ref = _weakref.ref(adapter)
             if transport_home is None:
-                allowed = self._is_user_authorized(source)
-            else:
-                source._authorization_profile_home = transport_home
-                if not self._stamp_routed_profile(source):
-                    return False  # fail-closed, like the ``_handle_message`` ingress gate
-                allowed = self._is_user_authorized_for_source(source)
-            if not allowed:
-                return False
-            return self._check_slash_access(source, command) is None if command else allowed
+                return self._is_user_authorized(source)
+            source._authorization_profile_home = transport_home
+            if not self._stamp_routed_profile(source):
+                return False  # fail-closed, like the ``_handle_message`` ingress gate
+            return self._is_user_authorized_for_source(source)
         return check

@@ -198,7 +198,13 @@ class ComputeHost:
             if error:
                 self._reply("respond.error", sid, request_id, message=error)
                 return
-            response = server._methods["clarify.respond"](request_id, params)
+            method = frame.get("method", "clarify.respond")
+            if method not in {"clarify.respond", "approval.respond"}:
+                self._reply("respond.error", sid, request_id, message="unsupported response method")
+                return
+            if method == "approval.respond":
+                params = {**params, "session_id": sid}
+            response = server._methods[method](request_id, params)
             self._reply("respond.ack", sid, request_id, response=response)
         self._guarded(frame, "respond.error", body)
 

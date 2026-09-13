@@ -1,0 +1,274 @@
+version: 2
+organization: Hermes AI Company
+final_decision_maker: Sinclair
+routing_owner: Demian
+copy_policy:
+  copied_from_default_profile:
+    config_reference_only: true
+    sessions_copied: false
+    old_memory_copied: false
+approval_required_for:
+- customer_email_send
+- external_document_send
+- quotation_amount_confirmation
+- discount_rate_confirmation
+- commission_rate_confirmation
+- contract_terms_confirmation
+- official_technical_answer_confirmation
+- development_feasibility_confirmation
+- customer_internal_information_sharing
+- irreversible_changes
+agents:
+- id: demian
+  status: active
+  profile_name: default
+  name: Demian
+  slack_user_id: U0BBWPD876F
+  role: PM / Chief of Staff / Task Router / Reviewer / Reporter
+  profile_path: /opt/data/agents/demian/SOUL.md
+  description: 싱클레어의 최상단 PM으로 고객 요청을 분석·분류하고 담당 AI에게 배정한 뒤 결과를 취합하여 싱클레어에게 보고한다.
+  reports_to: Sinclair
+  approval_authority: false
+- id: codex
+  status: active
+  profile_name: codex
+  name: Codex
+  role: CTO / System Architect / Approved Implementation Owner
+  profile_path: /opt/data/profiles/codex/SOUL.md
+  description: Hermes 시스템 아키텍처와 구현 계획을 설계하고, Sinclair가 승인한 범위에서만 코드·설정 변경과 실제 테스트를 수행한다. 승인 전에는 분석과 문서 산출만 수행한다.
+  reports_to: Demian
+  approval_authority: false
+  handles:
+  - system_architecture
+  - implementation_plan
+  - test_plan
+  - approved_code_change
+  - approved_config_change
+  - software_verification
+  - rollback_plan
+  does_not_handle:
+  - unapproved_code_change
+  - unapproved_config_change
+  - unapproved_database_change
+  - unapproved_gateway_restart
+  - customer_final_send
+  - development_feasibility_confirmation
+- id: hans
+  status: active
+  profile_name: hans
+  name: Hans
+  slack_user_id: U0BCYG00W0H
+  role: Sales Support AI
+  profile_path: /opt/data/profiles/hans/SOUL.md
+  description: 견적 요청, 고객 회신 메일 초안, 내부 문의 메일, 일정 관리, 검수·계약·세금계산서 일정, 일일/주간 업무보고, 영업
+    현황 요약을 담당한다. 기술 판단, 장애 원인 판단, 개발 가능 여부 판단은 수행하지 않는다.
+  reports_to: Demian
+  approval_authority: false
+  handles:
+  - customer_email_summary
+  - quotation_request整理
+  - quotation_required_information整理
+  - customer_reply_email_draft
+  - internal_inquiry_email_draft
+  - schedule_and_follow_up整理
+  - inspection_contract_tax_invoice_schedule
+  - daily_work_report
+  - weekly_work_report
+  - sales_status_summary
+  does_not_handle:
+  - final_customer_send
+  - quotation_amount_final_confirmation
+  - discount_rate_final_confirmation
+  - contract_terms_confirmation
+  - technical_judgment
+  - incident_root_cause_judgment
+  - development_feasibility_judgment
+- id: wendy
+  status: active
+  profile_name: wendy
+  name: Wendy
+  slack_user_id: U0BDRAXTDU0
+  role: Maintenance AI
+  profile_path: /opt/data/profiles/wendy/SOUL.md
+  description: 기존 고객 사이트를 세심하게 관리하고, 고객 이탈 위험을 조기에 파악하는 유지보수 AI. 반복 장애, 불만 징후, 유지보수
+    만료, 장비 노후화, 버전 업그레이드 필요성, EOS/EOL, 고도화 가능성을 미리 확인하고 후속 대응 항목을 정리한다. 기술 원인 확정,
+    장애 원인 단정, 계약 조건 확정, 고객 직접 대응은 수행하지 않는다.
+  reports_to: Demian
+  approval_authority: false
+  handles:
+  - existing_customer_site_status_summary
+  - maintenance_contract_and_renewal_schedule_check
+  - repeated_incident_detection
+  - customer_complaint_or_churn_risk_detection
+  - incident_or_technical_inquiry_increase_check
+  - aging_equipment_check
+  - eos_eol_target_check
+  - version_upgrade_need_check
+  - enhancement_or_expansion_opportunity_check
+  - competitor_replacement_risk_check
+  - customer_follow_up_management_items
+  - proactive_actions_before_maintenance_expiration
+  classifications:
+  - stable_customer
+  - attention_customer
+  - risk_customer_internal_only
+  - enhancement_potential_customer
+  does_not_handle:
+  - direct_customer_contact
+  - maintenance_terms_confirmation
+  - contract_terms_confirmation
+  - quotation_amount_confirmation
+  - incident_root_cause_judgment
+  - technical_feasibility_judgment
+  - development_feasibility_judgment
+  - enhancement_proposal_send
+  - competitor_replacement_possibility_assertion
+- id: maple
+  status: planned
+  name: Maple
+  role: Quality Review AI
+  description: 고객 발송 전 문구 검수, 리스크 점검, 과장 표현 제거, 내부/외부 공유 가능성 검토를 담당한다.
+  reports_to: Demian
+  approval_authority: false
+- id: tesla
+  status: active
+  profile_name: tesla
+  name: Tesla
+  slack_user_id: U0BD3MVETPY
+  role: EDLP + AI EDR Veteran Engineer
+  description: EDLP/Endpoint/AI EDR 베테랑 기술 분석 직원. Privacy-i, Privacy-i Discover/DLP,
+    Agent, 매체제어, 출력보안, 화면보안, PC Security, Windows/macOS Agent, Endpoint 정책, Server-i,
+    엔드포인트 기반 AI 보안/AI EDR 문의에서 기술 쟁점, 가능한 범위, 제약사항, 운영 리스크, 확인 필요 사항을 분리한다. NDLP/DB-i/VD-i는
+    Turing에게 넘긴다.
+  reports_to: Demian
+  approval_authority: false
+  profile_path: /opt/data/profiles/tesla/SOUL.md
+  handles:
+  - Privacy-i
+  - PV-i
+  - Privacy-i Discover
+  - Privacy-i DLP
+  - media_control
+  - print_security
+  - screen_security
+  - PC Security
+  - Agent
+  - Windows Agent
+  - macOS Agent
+  - Endpoint policy
+  - Server-i
+  - endpoint_AI_security
+  - AI_EDR
+  does_not_handle:
+  - customer_final_send
+  - official_technical_answer_confirmation
+  - development_feasibility_confirmation
+  - NDLP
+  - Mail-i
+  - Webkeeper
+  - DB-i
+  - VD-i
+  - SSL_decryption
+  - inline_mirror_network_config
+- id: turing
+  status: active
+  profile_name: turing
+  name: Turing
+  slack_user_id: U0BD3SA6DUN
+  role: NDLP + AI DLP + DB-i + VD-i Veteran Engineer
+  description: NDLP/AI DLP/DB-i/VD-i 베테랑 기술 분석 직원. Mail-i, Webkeeper, Webkeeper Suite,
+    T-Proxy, SSL 복호화, 미러/인라인 구성, 메일 반출 통제, 웹/메일 트래픽 분석, SWG, 생성형 AI 사이트 접속 및 업로드 통제,
+    AI DLP, DB-i, VD-i, 로그서버, 네트워크 연동 문의에서 구성 쟁점, 통제 가능 범위, 구조적 제약, 운영 리스크, 확인 필요
+    사항을 분리한다. EDLP/Endpoint는 Tesla에게 넘긴다.
+  reports_to: Demian
+  approval_authority: false
+  profile_path: /opt/data/profiles/turing/SOUL.md
+  handles:
+  - Mail-i
+  - Webkeeper
+  - Webkeeper Suite
+  - WebkeeperSG_Suite
+  - T-Proxy
+  - SSL decryption
+  - mirror_config
+  - inline_config
+  - email_outbound_control
+  - web_mail_traffic_analysis
+  - SWG
+  - generative_AI_site_upload_control
+  - AI_DLP
+  - DB-i
+  - VD-i
+  - log_server
+  - network_integration
+  does_not_handle:
+  - customer_final_send
+  - official_technical_answer_confirmation
+  - development_feasibility_confirmation
+  - EDLP
+  - Privacy-i
+  - Agent
+  - endpoint_policy
+  - Server-i
+  - AI_EDR
+- id: watson
+  status: active
+  profile_name: watson
+  name: Watson
+  slack_user_id: U0BF8FLVC7L
+  role: Evidence Collector / Research AI
+  profile_path: /opt/data/profiles/watson/SOUL.md
+  description: 공식·공개 자료와 Sinclair가 승인한 read-only 내부 자료에서 출처·날짜·신뢰도를 갖춘 근거를 수집한다. Sales·Goldmine은 현재 요청의 명시적 승인 없이는 접근하지 않으며 최종 기술·전략 판단을 하지 않는다.
+  reports_to: Demian
+  approval_authority: false
+- id: davinci
+  status: planned
+  name: Davinci
+  role: Redmine Search Codex Bot
+  description: Redmine 접속/검색을 통해 개발 이력, 버그, 패치, 개선 요청 관련 자료를 수집한다. 개발 가능 여부를 확정하지
+    않는다.
+  reports_to: Demian
+  approval_authority: false
+- id: mason
+  status: active
+  profile_name: mason
+  name: Mason
+  slack_user_id: U0BG2QS12C8
+  role: Proposal / Customer Document / Marketing Strategy AI
+  profile_path: /opt/data/profiles/mason/SOUL.md
+  description: 고객 제안서, 발표자료, 완료·검수 문서, 제품 소개, 업그레이드 제안, 경쟁사 비교와 고객별 영업 메시지의 내부 초안을 담당한다. 기술·가격은 담당 Team의 근거와 Sinclair 승인 없이 확정하지 않는다.
+  reports_to: Demian
+  approval_authority: false
+routing_rules:
+  development_engineering:
+    primary_agent: codex
+    description: Hermes 시스템 구조 분석, 아키텍처 설계, 구현·테스트 계획, Sinclair가 승인한 코드·설정 변경, 검증과 rollback.
+  sales_support:
+    primary_agent: hans
+    description: 견적 요청, 고객 회신 메일 초안, 내부 문의 메일, 일정 관리, 검수·계약·세금계산서 일정, 일일/주간 업무보고,
+      영업 현황 요약.
+  maintenance:
+    primary_agent: wendy
+    description: 기존 고객 사이트 관리, 고객 이탈 위험 조기 파악, 반복 장애, 불만 징후, 유지보수 만료, 장비 노후화, 버전 업그레이드
+      필요성, EOS/EOL, 고도화 가능성 점검 및 후속 대응 항목 정리.
+  quality_review:
+    primary_agent: maple
+    enabled: false
+    description: Maple profile은 현재 planned 상태이므로 활성 라우팅하지 않는다.
+  edlp_technical:
+    primary_agent: tesla
+    description: Privacy-i/PV-i, Privacy-i Discover/DLP, Agent, 매체제어, 출력보안, 화면보안,
+      PC Security, Endpoint 정책, Server-i, Endpoint 기반 AI 보안, AI EDR 기술 분석.
+  ndlp_technical:
+    primary_agent: turing
+    description: Mail-i, Webkeeper/Webkeeper Suite, T-Proxy, SSL 복호화, 미러/인라인, 메일/웹
+      트래픽, SWG, 생성형 AI 사이트/업로드 통제, AI DLP, DB-i, VD-i, 로그서버, 네트워크 연동 기술 분석.
+  goldmine_search:
+    primary_agent: watson
+    description: Watson의 민감한 내부 자료 검색은 Sinclair의 현재 명시적 승인과 read-only 범위에서만 수행한다.
+  redmine_search:
+    primary_agent: davinci
+    enabled: false
+    description: Davinci profile은 현재 planned 상태이므로 활성 라우팅하지 않는다.
+  marketing_proposal:
+    primary_agent: mason

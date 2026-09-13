@@ -327,16 +327,6 @@ class GatewayTurnMixin:
                 return
             session_entry = resolved_entry
         self._cache_session_source(session_key, source)
-        if not bool(getattr(event, "internal", False)):
-            try:
-                from gateway.wisdom_mediation import schedule as observe_wisdom_session
-
-                await observe_wisdom_session(
-                    self, self._adapter_for_source(source), source,
-                    str(session_entry.session_id), observe_only=True,
-                )
-            except Exception:
-                logger.debug("Wisdom session activity unavailable", exc_info=True)
         if await asyncio.to_thread(self._is_telegram_topic_lane, source):
             session_entry = await self._hmwa_heal_telegram_topic_binding(source, session_entry, session_key)
         from gateway.run_heartbeat_acceptance import resolve_heartbeat_owner
@@ -2697,7 +2687,8 @@ class GatewayTurnMixin:
         # ordinary text tool_progress off by default (requiring both flags would silently leave the native
         # feature inactive).
         _native_slack_task_cards = False
-        if source.platform == Platform.SLACK and hasattr(adapter, "native_task_cards_enabled"):
+        if (source.platform == Platform.SLACK and hasattr(adapter, "native_task_cards_enabled")
+                and getattr(source, "_work_router_owned_final", False) is not True):
             try:
                 _native_slack_task_cards = bool(adapter.native_task_cards_enabled())
             except Exception:
@@ -2910,6 +2901,8 @@ class GatewayTurnMixin:
 
         Created on the gateway loop thread (not run_sync's executor); an inactive consumer leaves
         the holder None so the whole-file fallback path runs."""
+        if getattr(source, "_work_router_owned_final", False) is True:
+            return
         # Skip when streaming TTS already delivered audio for this turn (#60671).
         # This avoids a cross-scope NameError: the outer interrupt / finalisation paths reference the
         # consumer via ``streaming_tts_consumer_holder[0]``. Gates: voice input, auto-TTS enabled for this

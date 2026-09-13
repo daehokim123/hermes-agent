@@ -1182,11 +1182,19 @@ def _(rid, params: dict) -> dict:
         session = _approval_respond_session_fallback(params)
         if session is None:
             return err
-    return _approval_reply(
+    if _session_uses_compute_host(session):
+        from tui_gateway.approval_response import respond_via_host
+        return respond_via_host(rid, params, session)
+    response = _approval_reply(
         rid, "resolved",
         lambda a: a.resolve_gateway_approval(
             session["session_key"], params.get("choice", "deny"),
             resolve_all=params.get("all", False), request_id=params.get("request_id")))
+    from approval_trace import log_approval_delivery
+    log_approval_delivery(logger, "APPROVAL_RESOLVE", request_id=params.get("request_id"),
+                          session_id=session["session_key"],
+                          success=(response.get("result") or {}).get("resolved", 0) > 0)
+    return response
 
 
 def register(server) -> None:

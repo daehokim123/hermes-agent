@@ -320,7 +320,11 @@ class TestAppMentionHandler:
 
         mock_app = MagicMock()
 
-        def mock_event(event_type):
+        def mock_event(event_type, matchers=None, middleware=None):
+            # Match Bolt's public registration API; message admission must not
+            # lose its pre-listener selection middleware to satisfy a fake.
+            if event_type in {"message", "app_mention"}:
+                assert middleware and all(callable(item) for item in middleware)
             def decorator(fn):
                 registered_events.append(event_type)
                 return fn
@@ -424,7 +428,7 @@ class TestAppMentionHandler:
         config = PlatformConfig(enabled=True, token="xoxb-default")
         adapter = SlackAdapter(config)
 
-        def _noop_decorator(_matcher):
+        def _noop_decorator(_matcher, matchers=None, middleware=None):
             def decorator(fn):
                 return fn
 
@@ -506,7 +510,7 @@ class TestSlackConnectCleanup:
 
         mock_app = MagicMock()
 
-        def _noop_decorator(event_type):
+        def _noop_decorator(event_type, matchers=None, middleware=None):
             def decorator(fn):
                 return fn
 
@@ -652,7 +656,7 @@ class TestSlackSocketWatchdog:
         """Return a list of patcher context managers to keep active for the test."""
         mock_app = MagicMock()
 
-        def _noop_decorator(_):
+        def _noop_decorator(_, matchers=None, middleware=None):
             def decorator(fn):
                 return fn
 
@@ -895,7 +899,7 @@ class TestSlackProxyBehavior:
                 self.registered_actions = []
                 created_apps.append(self)
 
-            def event(self, event_type):
+            def event(self, event_type, matchers=None, middleware=None):
                 self.registered_events.append(event_type)
 
                 def decorator(fn):

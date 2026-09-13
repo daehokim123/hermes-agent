@@ -48,6 +48,7 @@ import { onUserWidgets } from '../sdk/userWidgets.js'
 import type { Msg, PanelSection, SlashCatalog } from '../types.js'
 
 import { applyAgentSnapshot } from './agentRoster.js'
+import { respondToApproval } from './approvalResponse.js'
 import { createGatewayEventHandler } from './createGatewayEventHandler.js'
 import { createSlashHandler } from './createSlashHandler.js'
 import { planGatewayRecovery } from './gatewayRecovery.js'
@@ -1020,15 +1021,7 @@ export function useMainApp(gw: GatewayClient) {
     [rpc]
   )
 
-  const answerApproval = useCallback(
-    (choice: string) =>
-      respondWith('approval.respond', { choice, session_id: ui.sid }, () => {
-        patchOverlayState({ approval: null })
-        patchTurnState({ outcome: choice === 'deny' ? 'denied' : `approved (${choice})` })
-        patchUiState({ status: 'running…' })
-      }),
-    [respondWith, ui.sid]
-  )
+  const answerApproval = useCallback((choice: string) => respondToApproval(rpc, choice), [rpc])
 
   const answerSudo = useCallback(
     (pw: string) => {
