@@ -14,10 +14,15 @@
 // their lines, and a failure is then hard to read.
 //
 // This also runs on a laptop: `node .github/scripts/run-workspace-checks.mjs`.
-// `--concurrency N` sets the limit. `--list` prints the units and exits.
+// `--concurrency N` sets the limit. `--only package::script` selects one unit
+// for an isolated receipt. `--list` prints the selected units and exits.
 
 import { execFileSync, spawn } from 'node:child_process'
+import { mkdir, writeFile } from 'node:fs/promises'
 import { availableParallelism } from 'node:os'
+import { join } from 'node:path'
+import { finished } from 'node:stream/promises'
+import { pathToFileURL } from 'node:url'
 
 const IS_CI = Boolean(process.env.GITHUB_ACTIONS)
 const NPM = process.platform === 'win32' ? 'npm.cmd' : 'npm'
@@ -46,41 +51,89 @@ function discoverUnits() {
 }
 
 /** @param {{pkg: string, script: string}} unit */
-function runUnit(unit) {
+export function collectChildResult(child, unit, started) {
   return new Promise((resolve) => {
-    const started = Date.now()
-    const child = spawn(NPM, ['run', '--prefix', unit.pkg, unit.script], {
-      // Buffer, and do not inherit. Children that share one stdout
-      // interleave their lines, and a failure is then hard to read.
-      stdio: ['ignore', 'pipe', 'pipe'],
-      shell: process.platform === 'win32',
-    })
     /** @type {Buffer[]} */
-    const chunks = []
-    child.stdout.on('data', (c) => chunks.push(c))
-    child.stderr.on('data', (c) => chunks.push(c))
+    const stdoutChunks = []
+    /** @type {Buffer[]} */
+    const stderrChunks = []
+    child.stdout.on('data', (c) => stdoutChunks.push(c))
+    child.stderr.on('data', (c) => stderrChunks.push(c))
+    const stdoutFinished = finished(child.stdout).catch((error) => error)
+    const stderrFinished = finished(child.stderr).catch((error) => error)
+    let spawnError = null
     child.on('error', (err) => {
-      chunks.push(Buffer.from(`failed to spawn: ${err.message}\n`))
-      resolve({ unit, code: 1, output: Buffer.concat(chunks).toString('utf-8'), ms: Date.now() - started })
+      spawnError = err
     })
-    child.on('close', (code) => {
+    child.on('close', async (code, signal) => {
+      const streamErrors = (await Promise.all([stdoutFinished, stderrFinished])).filter(Boolean)
+      if (spawnError) stderrChunks.push(Buffer.from(`failed to spawn: ${spawnError.message}\n`))
+      for (const error of streamErrors) {
+        stderrChunks.push(Buffer.from(`failed to drain child output: ${error.message}\n`))
+      }
       resolve({
         unit,
         code: code ?? 1,
-        output: Buffer.concat(chunks).toString('utf-8'),
+        signal,
+        stdout: Buffer.concat(stdoutChunks).toString('utf-8'),
+        stderr: Buffer.concat(stderrChunks).toString('utf-8'),
         ms: Date.now() - started,
       })
     })
   })
 }
 
-async function main() {
+/** @param {{pkg: string, script: string}} unit */
+function runUnit(unit) {
+  const started = Date.now()
+  const child = spawn(NPM, ['run', '--prefix', unit.pkg, unit.script], {
+    // Buffer, and do not inherit. Children that share one stdout
+    // interleave their lines, and a failure is then hard to read.
+    stdio: ['ignore', 'pipe', 'pipe'],
+    shell: process.platform === 'win32',
+  })
+  return collectChildResult(child, unit, started)
+}
+
+function logFilename(unit) {
+  return `${unit.pkg}--${unit.script}`.replaceAll(/[^A-Za-z0-9_.-]/g, '_')
+}
+
+async function writeResultLogs(logDir, result) {
+  await mkdir(logDir, { recursive: true })
+  const base = join(logDir, logFilename(result.unit))
+  await Promise.all([
+    writeFile(`${base}.stdout.log`, result.stdout),
+    writeFile(`${base}.stderr.log`, result.stderr),
+    writeFile(`${base}.result.json`, `${JSON.stringify({
+      ...result.unit,
+      code: result.code,
+      signal: result.signal,
+      ms: result.ms,
+    }, null, 2)}\n`),
+  ])
+}
+
+export async function main() {
   const argv = process.argv.slice(2)
-  const units = discoverUnits()
+  const discoveredUnits = discoverUnits()
+  const onlyIdx = argv.indexOf('--only')
+  const only = onlyIdx === -1 ? null : argv[onlyIdx + 1]
+  if (onlyIdx !== -1 && !only) {
+    console.error('::error::--only requires a package::script value.')
+    process.exitCode = 1
+    return
+  }
+  const units = only
+    ? discoveredUnits.filter((unit) => `${unit.pkg}::${unit.script}` === only)
+    : discoveredUnits
+  const logDir = process.env.RUNNER_TEMP ? join(process.env.RUNNER_TEMP, 'workspace-check-logs') : null
 
   if (units.length === 0) {
     console.error(
-      '::error::No workspace package declares a check script — refusing to report green having run nothing.',
+      only
+        ? `::error::No workspace check matches --only ${only}.`
+        : '::error::No workspace package declares a check script — refusing to report green having run nothing.',
     )
     process.exit(1)
   }
@@ -101,7 +154,7 @@ async function main() {
   console.log('')
 
   const queue = [...units]
-  /** @type {{unit: {pkg: string, script: string}, code: number, output: string, ms: number}[]} */
+  /** @type {{unit: {pkg: string, script: string}, code: number, signal: string|null, stdout: string, stderr: string, ms: number}[]} */
   const results = []
 
   async function worker() {
@@ -110,12 +163,15 @@ async function main() {
       if (!unit) return
       const res = await runUnit(unit)
       results.push(res)
+      if (logDir) await writeResultLogs(logDir, res)
       const label = `${res.unit.pkg} :: ${res.unit.script}`
       const secs = (res.ms / 1000).toFixed(1)
       const status = res.code === 0 ? 'PASS' : 'FAIL'
       if (IS_CI) console.log(`::group::${status} ${label} (${secs}s)`)
       else console.log(`----- ${status} ${label} (${secs}s) -----`)
-      process.stdout.write(res.output.endsWith('\n') ? res.output : res.output + '\n')
+      if (res.stdout) process.stdout.write(res.stdout.endsWith('\n') ? res.stdout : res.stdout + '\n')
+      if (res.stderr) process.stderr.write(res.stderr.endsWith('\n') ? res.stderr : res.stderr + '\n')
+      if (res.signal) console.error(`child terminated by signal ${res.signal}`)
       if (IS_CI) console.log('::endgroup::')
     }
   }
@@ -131,11 +187,17 @@ async function main() {
   }
 
   if (failed.length > 0) {
-    for (const r of failed) console.error(`::error::${r.unit.pkg} :: ${r.unit.script} failed`)
+    for (const r of failed) {
+      const outcome = r.signal ? `signal ${r.signal}` : `exit code ${r.code}`
+      console.error(`::error::${r.unit.pkg} :: ${r.unit.script} failed (${outcome})`)
+    }
     console.error(`::error::${failed.length} of ${results.length} checks failed`)
-    process.exit(1)
+    process.exitCode = 1
+    return
   }
   console.log(`\nall ${results.length} checks passed`)
 }
 
-await main()
+if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  await main()
+}
