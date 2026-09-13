@@ -767,11 +767,20 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
     if (ev.type === 'approval.request') {
       const accepted = !ev.session_id || ev.session_id === sid
-      console.warn('approval_delivery_trace ' + JSON.stringify({
-        event: 'TUI_APPROVAL_RECEIVE', request_id: ev.payload.request_id ?? '',
-        received_session: ev.session_id ?? '', current_ui_session: sid ?? '', accepted
-      }))
-      if (!accepted) return
+      console.warn(
+        'approval_delivery_trace ' +
+          JSON.stringify({
+            event: 'TUI_APPROVAL_RECEIVE',
+            request_id: ev.payload.request_id ?? '',
+            received_session: ev.session_id ?? '',
+            current_ui_session: sid ?? '',
+            accepted
+          })
+      )
+
+      if (!accepted) {
+        return
+      }
     }
 
     if (ev.session_id && sid && ev.session_id !== sid && !ev.type.startsWith('gateway.')) {
