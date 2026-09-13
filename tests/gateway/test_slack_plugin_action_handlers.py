@@ -155,7 +155,7 @@ def _connect_with_recording_app(
             return fn
         return decorator
 
-    def mock_event(_event_type):
+    def mock_event(_event_type, *, middleware=None):
         def decorator(fn):
             return fn
         return decorator
@@ -230,7 +230,7 @@ class TestSlackAdapterPluginActionWiring:
                 return fn
             return decorator
 
-        def _noop(_):
+        def _noop(_, *, middleware=None):
             def decorator(fn): return fn
             return decorator
 

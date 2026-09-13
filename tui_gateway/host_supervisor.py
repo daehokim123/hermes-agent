@@ -250,11 +250,14 @@ class HostSupervisor:
             with self._lock:
                 self._pending_controls.pop(request_id, None)
 
-    def respond(self, sid: str, params: dict[str, Any], *, timeout: float = 15.0) -> dict:
+    def respond(self, sid: str, params: dict[str, Any], *, timeout: float = 15.0,
+                method: str = "clarify.respond") -> dict:
         """Deliver an interactive prompt response to the host that owns it."""
         self.start()
         request_id = uuid.uuid4().hex
         frame = {"type": "respond", "sid": sid, "request_id": request_id, "params": dict(params)}
+        if method != "clarify.respond":
+            frame["method"] = method
         return self._await_reply(frame, request_id, timeout)
 
     def reload_mcp(self, sid: str, *, request_id: str | None = None) -> dict:

@@ -84,7 +84,7 @@ def _connect_and_capture_handlers():
 
     mock_app = MagicMock()
 
-    def mock_event(event_type):
+    def mock_event(event_type, *, middleware=None):
         def decorator(fn):
             registered.append((event_type, fn))
             return fn

@@ -18,7 +18,8 @@ from contextlib import suppress
 from datetime import datetime
 from gateway.config import Platform
 from gateway.delivery import looks_like_telegram_private_chat_id
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType
+from gateway.platforms.base import BasePlatformAdapter
+from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionSource, build_session_key
 from gateway.restart import (
     DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT, GATEWAY_FATAL_CONFIG_EXIT_CODE, is_global_startup_conflict
@@ -88,6 +89,13 @@ class GatewayStartupMixin:
             await adapter.handle_message(event)
             drained += 1
         return drained
+
+    @staticmethod
+    def _start_free_tier_bootstrap() -> None:
+        """One bootstrap per process. `run_bootstrap` already records its own failure in the boot record
+        and never raises, so this is a plain call; it exists as a method so tests can seam it."""
+        from hermes_cli.free_tier_bootstrap import run_bootstrap
+        run_bootstrap(announce=False)
 
     def _start_startup_warmup(self) -> None:
         """Kick off the boot turn-machinery warm-up so it overlaps the network-bound platform
@@ -868,7 +876,8 @@ class GatewayStartupMixin:
         with _log_suppressed(logging.WARNING, "plugin discovery failed at gateway startup", exc_info=True):
             from hermes_cli.plugins import discover_plugins
             discover_plugins()
-        # Generic relay adapter only if GATEWAY_RELAY_URL / gateway.relay_url is set; no URL -> no-op.
+        # Relay entrypoints share the effective profile opt-out, including when a
+        # deployment injects a URL. No URL or explicitly disabled -> no side effects.
         try:
             from gateway.relay import (
                 register_relay_adapter, relay_url, self_provision_relay, send_relay_policy
@@ -1204,6 +1213,9 @@ class GatewayStartupMixin:
             )
         self._spawn_supervised(self._hosted_room_worker_watcher, "hosted_room_worker")
         self._start_loop_heartbeat_task()
+        from gateway.run_heartbeat_restore import restore_heartbeat_watches
+        self._start_heartbeat_poller()  # Keep retrying even when the first scan is empty.
+        await restore_heartbeat_watches(self)
         hook_count = len(self.hooks.loaded_hooks)
         if hook_count:
             logger.info("%s hook(s) loaded", hook_count)
@@ -1304,6 +1316,17 @@ class GatewayStartupMixin:
         self._spawn_supervised(self._drain_control_watcher, "drain_control_watcher")
 
     async def start(self) -> bool:
+        from gateway.work_router.integration import stop_runtimes
+        started = False
+        try:
+            started = await self._start_with_work_router()
+            return started
+        finally:
+            # _running may already be True when startup raises or returns False.
+            if not started:
+                await stop_runtimes(self)
+
+    async def _start_with_work_router(self) -> bool:
         """Start the gateway and all configured platform adapters."""
         logger.info("Starting Hermes Gateway...")
         self._start_install_faulthandler()
@@ -1313,6 +1336,12 @@ class GatewayStartupMixin:
         if self._start_check_access_policy():
             return True
         await self._start_recover_previous_run()
+        # The gateway is a boot owner of the Nous free tier, beside `cmd_chat` and `hermes serve`: every
+        # demand-time site (provider resolution, /login, the connector token) is a read that needs the
+        # identity to already exist. Blocking here, before any adapter connects, is what keeps a fast
+        # first DM from arriving with nothing to resolve. With the launch gate unset this is a local
+        # inventory and no network.
+        await asyncio.get_running_loop().run_in_executor(None, self._start_free_tier_bootstrap)
         # Serialize startup restore against inbound: adapters receive as soon as they connect, so inbound
         # queues until every synthetic resume turn has finished.
         self._startup_restore_in_progress = True
@@ -1321,6 +1350,8 @@ class GatewayStartupMixin:
         # Fresh boot: the gate opens while the turn machinery is still cold (skeleton prompts). Warm NOW
         # to overlap the connects; _finish_startup_restore awaits it (bounded).
         self._start_startup_warmup()
+        from gateway.work_router.integration import ensure_runtime
+        ensure_runtime(self)
         startup_nonretryable_errors: list[str] = []
         startup_retryable_errors: list[str] = []
         (

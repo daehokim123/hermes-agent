@@ -111,7 +111,13 @@ def _relay_compute_host_rpc(message: dict) -> bool:
                     session["_compute_host_pending_clarify"] = dict(payload)
                 elif _pending_clarify_matches(session, request_id):
                     session.pop("_compute_host_pending_clarify", None)
-    return write_json(message)
+    delivered = write_json(message)
+    if kind == "approval.request":
+        from approval_trace import log_approval_delivery
+        payload = params.get("payload") or {}
+        log_approval_delivery(logger, "APPROVAL_HOST_RELAY", request_id=payload.get("request_id"),
+                              session_id=params.get("session_id"), success=delivered)
+    return delivered
 
 
 def _history_lock(session: dict):

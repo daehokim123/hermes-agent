@@ -1712,30 +1712,11 @@ def _rebind_fallback_credential_pool(agent, fb_provider: str, fb_model: str) -> 
             logger.debug("Fallback to %s/%s: could not attach credential pool: %s", fb_provider, fb_model, exc)
 
 
-_RATE_LIMIT_FAILOVER_REASONS = frozenset({FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit})
-
-
-def _arm_rate_limit_cooldown(agent, reason: "FailoverReason | None") -> None:
-    """Arm the primary's exponential cooldown (60s → 2m → ... → 4h cap) on CONSECUTIVE rate-limits;
-    restore_primary_runtime resets the counter. Only when leaving the primary: chain-switching from
-    an active fallback means the primary was not the 429 source, so its cooldown is left alone."""
-    if reason not in _RATE_LIMIT_FAILOVER_REASONS:
-        return
-    current_provider = (getattr(agent, "provider", "") or "").strip().lower()
-    primary_provider = ((agent._primary_runtime or {}).get("provider") or "").strip().lower()
-    if getattr(agent, "_fallback_activated", False) and not (primary_provider and current_provider == primary_provider):
-        return
-    backoff_count = getattr(agent, "_rate_limit_backoff_count", 0)
-    agent._rate_limit_backoff_count = backoff_count + 1
-    backoff_seconds = min(60 * (2 ** backoff_count), 14400)
-    agent._rate_limited_until = time.monotonic() + backoff_seconds
-    logging.info("Rate-limit backoff level %d: cooldown %d s (%.1f min, backoff#%d)", backoff_count, backoff_seconds, backoff_seconds / 60, backoff_count + 1)
-
-
 def _fallback_chain_exhausted(agent, reason: "FailoverReason | None") -> bool:
     """Chain exhausted (always False). A non-empty chain walked on a non-rate-limit failure arms a
     short cooldown so next turn's restore_primary_runtime stays gated instead of replaying the whole
     context across every provider again."""
+    from agent.fallback_cooldown import _RATE_LIMIT_FAILOVER_REASONS
     if agent._fallback_chain and reason not in _RATE_LIMIT_FAILOVER_REASONS:
         agent._rate_limited_until = max(
             getattr(agent, "_rate_limited_until", 0) or 0, time.monotonic() + _FALLBACK_EXHAUSTED_COOLDOWN_S)
@@ -1749,6 +1730,10 @@ def _should_skip_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider:
         logger.debug("Fallback skip: %s previously marked unavailable", fb_key)
         return True
     if not fb_provider or not fb_model:
+        return True
+    from agent.fallback_cooldown import _is_entitlement_rejected
+    if _is_entitlement_rejected(agent, fb_provider, fb_model):
+        logger.info("Fallback skip: %s/%s was rejected as unentitled for this account", fb_provider, fb_model)
         return True
     local_skip_reason = _fallback_entry_unavailable_without_network(agent, fb)
     if local_skip_reason:
@@ -1844,99 +1829,108 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     """Switch to the next fallback model/provider in the chain; False when exhausted. Swaps client,
     model slug and provider in place so the retry loop continues on the new backend; client
     construction goes through resolve_provider_client (no duplicated provider→key mappings)."""
-    _arm_rate_limit_cooldown(agent, reason)
-    if agent._fallback_index >= len(agent._fallback_chain):
-        return _fallback_chain_exhausted(agent, reason)
-    fb = agent._fallback_chain[agent._fallback_index]
-    agent._fallback_index += 1
-    fb_key = _fallback_entry_key(fb)
-    if getattr(agent, "_unavailable_fallback_keys", None) is None:
-        agent._unavailable_fallback_keys = set()
-    unavailable = agent._unavailable_fallback_keys
-    fb_provider = (fb.get("provider") or "").strip().lower()
-    fb_model = (fb.get("model") or "").strip()
-    if _should_skip_fallback_candidate(agent, fb, fb_key, fb_provider, fb_model, unavailable):
-        return agent._try_activate_fallback(reason)
+    from agent.fallback_cooldown import _arm_rate_limit_cooldown
+    cooldown_seconds = _arm_rate_limit_cooldown(agent, reason)
+    while True:
+        if agent._fallback_index >= len(agent._fallback_chain):
+            return _fallback_chain_exhausted(agent, reason)
+        fb = agent._fallback_chain[agent._fallback_index]
+        agent._fallback_index += 1
+        fb_key = _fallback_entry_key(fb)
+        if getattr(agent, "_unavailable_fallback_keys", None) is None:
+            agent._unavailable_fallback_keys = set()
+        unavailable = agent._unavailable_fallback_keys
+        fb_provider = (fb.get("provider") or "").strip().lower()
+        fb_model = (fb.get("model") or "").strip()
+        if _should_skip_fallback_candidate(agent, fb, fb_key, fb_provider, fb_model, unavailable):
+            continue
 
-    try:
-        from agent.auxiliary_client import resolve_provider_client
-        from hermes_cli.fallback_config import resolve_entry_api_key
-        # Pass the entry's base_url/api_key so custom endpoints (Ollama Cloud) resolve instead
-        # of falling through to OpenRouter defaults.
-        fb_base_url_hint = (fb.get("base_url") or "").strip() or None
-        fb_api_key_hint = resolve_entry_api_key(fb)
-        fb_api_mode_explicit, fb_api_mode = _fallback_api_mode_hint(fb, fb_provider, fb_base_url_hint)
-        # Ollama Cloud: OLLAMA_API_KEY from env when the entry has no key. Host match, not
-        # substring — GHSA-76xc-57q6-vm5m.
-        if fb_base_url_hint and base_url_host_matches(fb_base_url_hint, "ollama.com") and not fb_api_key_hint:
-            from agent.secret_scope import get_secret
-            fb_api_key_hint = get_secret("OLLAMA_API_KEY") or None
-        # raw_codex=True: the main agent needs direct responses.stream() access for Codex providers.
-        fb_client, _resolved_fb_model = resolve_provider_client(
-            fb_provider, model=fb_model, raw_codex=True, explicit_base_url=fb_base_url_hint, explicit_api_key=fb_api_key_hint, api_mode=fb_api_mode)
-        if fb_client is None:
-            logger.warning("Fallback to %s failed: provider not configured", fb_provider)
-            unavailable.add(fb_key)
-            return agent._try_activate_fallback(reason)
         try:
-            from hermes_cli.model_normalize import normalize_model_for_provider
-            fb_model = normalize_model_for_provider(fb_model, fb_provider)
-        except Exception as _norm_err:
-            logger.warning("Could not normalize fallback model %r for provider %r: %s", fb_model, fb_provider, _norm_err)
+            from agent.auxiliary_client import resolve_provider_client
+            from hermes_cli.fallback_config import resolve_entry_api_key
+            # Pass the entry's base_url/api_key so custom endpoints (Ollama Cloud) resolve instead
+            # of falling through to OpenRouter defaults.
+            fb_base_url_hint = (fb.get("base_url") or "").strip() or None
+            fb_api_key_hint = resolve_entry_api_key(fb)
+            fb_api_mode_explicit, fb_api_mode = _fallback_api_mode_hint(fb, fb_provider, fb_base_url_hint)
+            # Ollama Cloud: OLLAMA_API_KEY from env when the entry has no key. Host match, not
+            # substring — GHSA-76xc-57q6-vm5m.
+            if fb_base_url_hint and base_url_host_matches(fb_base_url_hint, "ollama.com") and not fb_api_key_hint:
+                from agent.secret_scope import get_secret
+                fb_api_key_hint = get_secret("OLLAMA_API_KEY") or None
+            # raw_codex=True: the main agent needs direct responses.stream() access for Codex providers.
+            fb_client, _resolved_fb_model = resolve_provider_client(
+                fb_provider, model=fb_model, raw_codex=True, explicit_base_url=fb_base_url_hint, explicit_api_key=fb_api_key_hint, api_mode=fb_api_mode)
+            if fb_client is None:
+                logger.warning("Fallback to %s failed: provider not configured", fb_provider)
+                unavailable.add(fb_key)
+                continue
+            try:
+                from hermes_cli.model_normalize import normalize_model_for_provider
+                fb_model = normalize_model_for_provider(fb_model, fb_provider)
+            except Exception as _norm_err:
+                logger.warning("Could not normalize fallback model %r for provider %r: %s", fb_model, fb_provider, _norm_err)
 
-        fb_base_url = str(fb_client.base_url)
-        if not fb_api_mode_explicit and fb_api_mode == "chat_completions":
-            fb_api_mode = _fallback_api_mode_resolved(agent, fb_provider, fb_model, fb_base_url)
+            fb_base_url = str(fb_client.base_url)
+            from hermes_cli.providers import is_actual_route
+            if is_actual_route(fb_provider, fb_base_url):
+                fb_api_mode = "chat_completions"
+            elif not fb_api_mode_explicit and fb_api_mode == "chat_completions":
+                fb_api_mode = _fallback_api_mode_resolved(agent, fb_provider, fb_model, fb_base_url)
 
-        old_model, old_provider, old_base_url = agent.model, agent.provider, agent.base_url
+            old_model, old_provider, old_base_url = agent.model, agent.provider, agent.base_url
 
-        # Clear the per-config context_length override so the fallback model's own context
-        # window is resolved instead of the previous model's stale value.
-        # See #22387.
-        agent._config_context_length = None
-        agent.model, agent.provider, agent.requested_provider = fb_model, fb_provider, fb_provider
-        agent.base_url, agent.api_mode = fb_base_url, fb_api_mode
-        # reasoning_content echo opt-in travels with the active provider; restore_primary_runtime reverts it.
-        agent._reasoning_echo_flag = bool(fb.get("reasoning_echo", False))
-        if hasattr(agent, "_transport_cache"):
-            agent._transport_cache.clear()
-        agent._fallback_activated = True
+            # Clear the per-config context_length override so the fallback model's own context
+            # window is resolved instead of the previous model's stale value.
+            # See #22387.
+            agent._config_context_length = None
+            agent.model, agent.provider, agent.requested_provider = fb_model, fb_provider, fb_provider
+            agent.base_url, agent.api_mode = fb_base_url, fb_api_mode
+            # reasoning_content echo opt-in travels with the active provider; restore_primary_runtime reverts it.
+            agent._reasoning_echo_flag = bool(fb.get("reasoning_echo", False))
+            if hasattr(agent, "_transport_cache"):
+                agent._transport_cache.clear()
+            agent._fallback_activated = True
 
-        _rebind_fallback_credential_pool(agent, fb_provider, fb_model)
-        from agent.client_lifecycle import _swap_fallback_clients
-        _swap_fallback_clients(agent, fb_client, fb_provider, fb_model, fb_base_url, fb_api_mode)
+            _rebind_fallback_credential_pool(agent, fb_provider, fb_model)
+            from agent.client_lifecycle import _swap_fallback_clients
+            _swap_fallback_clients(agent, fb_client, fb_provider, fb_model, fb_base_url, fb_api_mode)
 
-        from agent.agent_runtime_helpers import sync_credential_pool_entry_id
-        sync_credential_pool_entry_id(agent)
+            from agent.agent_runtime_helpers import sync_credential_pool_entry_id
+            sync_credential_pool_entry_id(agent)
 
-        agent._use_prompt_caching, agent._use_native_cache_layout = agent._anthropic_prompt_cache_policy(
-            provider=fb_provider, base_url=fb_base_url, api_mode=fb_api_mode, model=fb_model)
-        agent._ensure_lmstudio_runtime_loaded()  # LM Studio: preload before probing context length
-        _update_fallback_context_compressor(agent)
-        _reresolve_fallback_reasoning_config(agent)
-        _rescope_fallback_extra_body(agent, old_model, old_provider, old_base_url)
-        rewrite_prompt_model_identity(agent, fb_model, fb_provider)
+            agent._use_prompt_caching, agent._use_native_cache_layout = agent._anthropic_prompt_cache_policy(
+                provider=fb_provider, base_url=fb_base_url, api_mode=fb_api_mode, model=fb_model)
+            agent._ensure_lmstudio_runtime_loaded()  # LM Studio: preload before probing context length
+            _update_fallback_context_compressor(agent)
+            _reresolve_fallback_reasoning_config(agent)
+            _rescope_fallback_extra_body(agent, old_model, old_provider, old_base_url)
+            rewrite_prompt_model_identity(agent, fb_model, fb_provider)
 
-        _buffer_fallback_notice(agent, (
-            f"⚠️ Model fallback: {old_model} via {old_provider} unavailable "
-            f"({_fallback_reason_text(reason)}); using {fb_model} via {fb_provider}."))
-        # ``_fallback_activated`` is also reused by `/model --once` restoration; separate
-        # provenance so the restore path only emits a recovery notice after a real fallback.
-        agent._provider_fallback_active = True
-        agent._provider_fallback_route = (str(fb_model), str(fb_provider))
-        logger.info("Fallback activated: %s → %s (%s)", old_model, fb_model, fb_provider)
-        # The stale-call streak measured the OLD provider; carrying it over would
-        # short-circuit the fresh fallback before its first stream attempt.
-        _reset_stale_streak(agent)
-        from agent.native_compaction import resolve_native_compaction_capabilities
-        agent.runtime_capabilities = resolve_native_compaction_capabilities(
-            model=agent.model, base_url=agent.base_url, provider=fb_provider, is_codex_backend=fb_provider == "openai-codex")
-        return True
-    except Exception as e:
-        if fb_provider == "nous":
-            unavailable.add(fb_key)
-        logger.error("Failed to activate fallback %s: %s", fb_model, e)
-        return agent._try_activate_fallback(reason)  # try next in chain
+            notice = (
+                f"⚠️ Model fallback: {old_model} via {old_provider} unavailable "
+                f"({_fallback_reason_text(reason)}); using {fb_model} via {fb_provider}.")
+            if cooldown_seconds is not None:
+                remaining = max(0, math.ceil(agent._rate_limited_until - time.monotonic()))
+                notice += f" Primary retry eligible in ~{remaining} s; recovery is not guaranteed."
+            _buffer_fallback_notice(agent, notice)
+            # ``_fallback_activated`` is also reused by `/model --once` restoration; separate
+            # provenance so the restore path only emits a recovery notice after a real fallback.
+            agent._provider_fallback_active = True
+            agent._provider_fallback_route = (str(fb_model), str(fb_provider))
+            logger.info("Fallback activated: %s → %s (%s)", old_model, fb_model, fb_provider)
+            # The stale-call streak measured the OLD provider; carrying it over would
+            # short-circuit the fresh fallback before its first stream attempt.
+            _reset_stale_streak(agent)
+            from agent.native_compaction import resolve_native_compaction_capabilities
+            agent.runtime_capabilities = resolve_native_compaction_capabilities(
+                model=agent.model, base_url=agent.base_url, provider=fb_provider, is_codex_backend=fb_provider == "openai-codex")
+            return True
+        except Exception as e:
+            if fb_provider == "nous":
+                unavailable.add(fb_key)
+            logger.error("Failed to activate fallback %s: %s", fb_model, e)
+            continue  # try next in chain
 
 
 # Keys outside the Chat Completions schema that strict gateways (Fireworks-backed OpenCode
@@ -2187,11 +2181,17 @@ def cleanup_task_resources(agent, task_id: str) -> None:
 
 
 def _build_partial_stream_stub(role, full_content, full_reasoning, model_name, usage_obj, *,
-    dropped_tool_names=None):
+    dropped_tool_names=None, overflow_terminal=False):
     """Stub for an SSE stream that ended without ``finish_reason`` after
     delivering content. Tagged ``PARTIAL_STREAM_STUB_ID`` + ``FINISH_REASON_LENGTH``
     so the loop enters its continuation/retry path instead of accepting
-    truncated output as a complete turn (#32086)."""
+    truncated output as a complete turn (#32086).
+
+    ``overflow_terminal`` (``full_content=None``): the stream died on a
+    context-overflow error. Seeding the recovered text as a continuation stub
+    would grow every later request into the same overflow (#106260); the loop
+    treats the marker as terminal and ends the turn via the recovery contract.
+    """
     return SimpleNamespace(
         id=PARTIAL_STREAM_STUB_ID,
         model=model_name,
@@ -2203,6 +2203,7 @@ def _build_partial_stream_stub(role, full_content, full_reasoning, model_name, u
         )],
         usage=usage_obj,
         _dropped_tool_names=dropped_tool_names or None,
+        _overflow_terminal=overflow_terminal,
     )
 
 
@@ -2706,6 +2707,7 @@ class _StreamingCall(StreamingWaitMonitor):
         response = self._attempt_stream_response = getattr(raw_stream, "response", None)
         self.agent._capture_rate_limits(response)
         self.agent._capture_credits(response)
+        self.agent._capture_nous_model_switch(response)
         self.agent._stream_diag_capture_response(self.clients.diag, response)
         self.agent._check_openrouter_cache_status(response)
         self._writer_token = claim_stream_writer(self.agent)
@@ -3273,22 +3275,37 @@ class _StreamingCall(StreamingWaitMonitor):
             logger.warning(
                 "Partial stream dropped tool call(s) %s after %s chars of text; surfaced warning to user: %s",
                 _partial_names, len(_partial_text or ""), error)
-        else:
-            logger.warning(
-                "Partial stream delivered before error; returning length-truncated stub with %s chars of "
-                "recovered content so the loop can continue from where the stream died: %s",
-                len(_partial_text or ""), error)
-        # Classify content filtering (MiniMax 1027, Azure content_filter, Anthropic refusal)
-        # before the error is swallowed into the stub: the loop reads the tag and falls back.
-        _stub = _build_partial_stream_stub("assistant", _partial_text, None,
-            getattr(self.agent, "model", "unknown"), None, dropped_tool_names=_partial_names)
+        # Classify the error before it is swallowed into the stub: the loop reads the
+        # content-filter tag and falls back; a context overflow must not be continued at all.
+        _cls = None
         with contextlib.suppress(Exception):
             from agent.error_classifier import classify_api_error
             _cls = classify_api_error(
                 error, provider=str(getattr(self.agent, "provider", "") or ""), model=str(getattr(self.agent, "model", "") or ""))
-            if _cls.reason == FailoverReason.content_policy_blocked:
-                _stub._content_filter_terminated = True
         _reset_stale_streak(self.agent)  # deltas fired => provider responsive: clear the breaker
+        # #106260: continuing after a context-overflow error re-sends a larger request into the
+        # same overflow. Return an EMPTY stub marked terminal so the loop ends the turn instead.
+        # Scope is context_overflow ONLY: payload_too_large (413) has its own byte-scored recovery
+        # owner (turn_overflow._recover_payload_too_large, #88960/#47339) that must not be bypassed.
+        if _cls is not None and _cls.reason == FailoverReason.context_overflow:
+            logger.warning(
+                "Partial stream ended on a context-overflow error after %s chars; "
+                "NOT seeding a continuation stub (transcript is already over budget): %s",
+                len(_partial_text or ""), error,
+            )
+            return _build_partial_stream_stub(
+                "assistant", None, None, getattr(self.agent, "model", "unknown"), None,
+                dropped_tool_names=_partial_names, overflow_terminal=True,
+            )
+        if not _partial_names:
+            logger.warning(
+                "Partial stream delivered before error; returning length-truncated stub with %s chars of "
+                "recovered content so the loop can continue from where the stream died: %s",
+                len(_partial_text or ""), error)
+        _stub = _build_partial_stream_stub("assistant", _partial_text, None,
+            getattr(self.agent, "model", "unknown"), None, dropped_tool_names=_partial_names)
+        if _cls is not None and _cls.reason == FailoverReason.content_policy_blocked:
+            _stub._content_filter_terminated = True
         return _stub
 
     def run(self):

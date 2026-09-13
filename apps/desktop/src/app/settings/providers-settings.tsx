@@ -135,7 +135,8 @@ function OAuthPicker({
   onTerminalDisconnect,
   onWantApiKey,
   onWantLocalModels,
-  providers
+  providers,
+  profile
 }: {
   disconnecting: null | string
   onDisconnect: (provider: OAuthProvider) => void
@@ -143,6 +144,7 @@ function OAuthPicker({
   onWantApiKey: () => void
   onWantLocalModels: () => void
   providers: OAuthProvider[]
+  profile?: string
 }) {
   const { t } = useI18n()
   const p = t.settings.providers
@@ -153,15 +155,18 @@ function OAuthPicker({
     return null
   }
 
-  const select = (p: OAuthProvider) => startManualProviderOAuth(p.id)
+  const select = (p: OAuthProvider) => startManualProviderOAuth(p.id, profile)
 
-  const featured = ordered.find(p => p.id === FEATURED_ID && !p.status?.logged_in) ?? null
+  // The free tier holds a token but no account: it is never "connected"; the featured Nous row
+  // names it (Nous · free tier) and offers the sign-in that keeps its connectors.
+  const isConnected = (p: OAuthProvider) => Boolean(p.status?.logged_in) && p.status?.free_tier !== true
+  const featured = ordered.find(p => p.id === FEATURED_ID && !isConnected(p)) ?? null
   const rest = featured ? ordered.filter(p => p.id !== FEATURED_ID) : ordered
   // Keep connected accounts grouped and always visible; only the unconnected
   // providers hide behind the disclosure, so the page leads with what's set up.
   // Both lists preserve `sortProviders` order (curated priority, then name).
-  const connected = rest.filter(p => p.status?.logged_in)
-  const others = rest.filter(p => !p.status?.logged_in)
+  const connected = rest.filter(isConnected)
+  const others = rest.filter(p => !isConnected(p))
   const collapsible = others.length > 0
   const showOthers = !collapsible || showAll
 
@@ -349,7 +354,6 @@ export function ProvidersSettings({
   view
 }: ProvidersSettingsProps) {
   const { t } = useI18n()
-  // Match the shared Settings target for credential reads and writes.
   const scopeProfile = useStore($settingsRequestProfile)
   const { rowProps, vars } = useEnvCredentials(scopeProfile)
   const [oauthProviders, setOauthProviders] = useState<OAuthProvider[]>([])
@@ -364,9 +368,9 @@ export function ProvidersSettings({
 
   const refreshOAuthProviders = useCallback(async () => {
     // OAuth providers are best-effort — a failure here just hides the panel.
-    const { providers } = await listOAuthProviders()
+    const { providers } = await listOAuthProviders(scopeProfile)
     setOauthProviders(providers)
-  }, [])
+  }, [scopeProfile])
 
   useEffect(() => {
     let cancelled = false
@@ -377,7 +381,7 @@ export function ProvidersSettings({
       }
 
       try {
-        const { providers } = await listOAuthProviders()
+        const { providers } = await listOAuthProviders(scopeProfile)
 
         if (!cancelled) {
           setOauthProviders(providers)
@@ -388,7 +392,7 @@ export function ProvidersSettings({
     })()
 
     return () => void (cancelled = true)
-  }, [onboardingActive])
+  }, [onboardingActive, scopeProfile])
 
   // External (CLI-managed) providers can't be cleared via the API by design —
   // Hermes never deletes creds another tool owns behind a silent API call.
@@ -439,7 +443,7 @@ export function ProvidersSettings({
     setDisconnecting(provider.id)
 
     try {
-      await disconnectOAuthProvider(provider.id)
+      await disconnectOAuthProvider(provider.id, scopeProfile)
       notify({
         durationMs: 3_000,
         kind: 'success',
@@ -479,7 +483,7 @@ export function ProvidersSettings({
     return (
       <SettingsContent>
         <SettingsProfileScope className="mb-5" />
-        <LocalEndpointRow onOpen={startManualLocalEndpoint} />
+        <LocalEndpointRow onOpen={reason => startManualLocalEndpoint(reason, scopeProfile)} />
         {keyGroups.length > 0 ? (
           <div className="grid gap-3">
             <SearchField
@@ -528,12 +532,14 @@ export function ProvidersSettings({
 
   return (
     <SettingsContent>
+      <SettingsProfileScope className="mb-5" />
       <OAuthPicker
         disconnecting={disconnecting}
         onDisconnect={provider => void handleDisconnect(provider)}
         onTerminalDisconnect={provider => void handleTerminalDisconnect(provider)}
         onWantApiKey={() => onViewChange('keys')}
         onWantLocalModels={() => onViewChange('local')}
+        profile={scopeProfile}
         providers={oauthProviders}
       />
     </SettingsContent>

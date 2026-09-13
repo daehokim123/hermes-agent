@@ -189,6 +189,18 @@ _PII_SAFE_PLATFORMS = frozenset({
 })
 
 
+def _should_redact_pii(platform: Platform, enabled: bool) -> bool:
+    """Keep model-visible identifiers usable on platforms requiring raw mentions."""
+    if not enabled or platform in _PII_SAFE_PLATFORMS:
+        return enabled
+    try:
+        from gateway.platform_registry import platform_registry
+        entry = platform_registry.get(platform.value)
+        return bool(entry and entry.pii_safe)
+    except Exception:
+        return False
+
+
 def _slack_tools_loaded() -> bool:
     """True iff the agent will actually have Slack tools this session.
 
@@ -357,13 +369,7 @@ def build_session_context_prompt(context: SessionContext, *, redact_pii: bool = 
     user/chat IDs become deterministic hashes for the LLM only; routing keeps the originals.
     """
     src = context.source
-    if redact_pii and src.platform not in _PII_SAFE_PLATFORMS:
-        try:
-            from gateway.platform_registry import platform_registry
-            entry = platform_registry.get(src.platform.value)
-            redact_pii = bool(entry and entry.pii_safe)
-        except Exception:
-            redact_pii = False
+    redact_pii = _should_redact_pii(src.platform, redact_pii)
 
     def _chat_label(chat_id: str) -> str:
         return _hash_chat_id(chat_id) if redact_pii else chat_id
@@ -1044,14 +1050,21 @@ class SessionStore(
 
     def set_model_override(self, session_key: str, override: Optional[Dict[str, Any]]) -> None:
         """Persist (or clear, with ``None``) the /model override; non-secret keys only."""
+        from dataclasses import replace
+
         cleaned = sanitize_model_override(override)
 
-        def _apply(entry: SessionEntry):
-            if entry.model_override == cleaned:
-                return False
+        with self._lock:
+            entry = self._entry_locked(session_key)
+            if entry is None or entry.model_override == cleaned:
+                return
+            # Publish only after persistence so a failed clear remains retryable.
+            data, generation = self._snapshot_routing_locked()
+            # Snapshot reconciliation may replace the entry after database recovery.
+            entry = self._entries[session_key]
+            data[session_key] = replace(entry, model_override=cleaned).to_dict()
+            self._persist_routing_data(data, generation)
             entry.model_override = cleaned
-
-        self._update_entry(session_key, _apply)
 
     def get_model_override(self, session_key: str) -> Optional[Dict[str, str]]:
         """Return the persisted /model override for *session_key*, if any."""

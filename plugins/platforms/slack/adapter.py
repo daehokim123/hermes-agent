@@ -11,6 +11,35 @@ import re
 import time
 import unicodedata
 from dataclasses import dataclass, field
+from enum import Enum
+
+
+class SlackAdmissionStatus(Enum):
+    ALLOW = "allow"
+    CONSUMED = "consumed"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True)
+class SlackAdmissionResult:
+    status: SlackAdmissionStatus
+    error: str | None = None
+
+
+@dataclass
+class _SocketAckReceipt:
+    event_id: str
+    completed: asyncio.Event = field(default_factory=asyncio.Event)
+    success: bool = False
+    journal: "Any" = None
+    native_called: bool = False
+    native_selected: bool = False
+
+
+_socket_ack_receipt: contextvars.ContextVar[_SocketAckReceipt | None] = contextvars.ContextVar(
+    "slack_socket_ack_receipt", default=None
+)
+
 from typing import Awaitable, Callable, ClassVar, Dict, Optional, Any, Tuple, List
 
 import aiohttp
@@ -35,11 +64,14 @@ sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
 from agent.secret_scope import UnscopedSecretError, get_secret
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import MessageDeduplicator
+from gateway.platforms._shared import get_scoped_secret as _get_scoped_secret
 from gateway.platforms.base import (
-    gateway_trust_env, BasePlatformAdapter, MessageEvent, MessageType, ProcessingOutcome,
+    gateway_trust_env, BasePlatformAdapter,
     SendResult, SUPPORTED_DOCUMENT_TYPES, SUPPORTED_VIDEO_TYPES, _TEXT_INJECT_EXTENSIONS,
     is_host_excluded_by_no_proxy, resolve_proxy_url, safe_url_for_log, _ssrf_redirect_guard,
-    cache_document_from_bytes_async, cache_video_from_bytes_async)
+    cache_document_from_bytes_async, cache_video_from_bytes_async,
+)
+from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 
 try:  # sibling module; support both package and flat plugin-dir import
     from .block_kit import render_blocks, sanitize_blocks
@@ -1077,11 +1109,166 @@ class SlackAdapter(BasePlatformAdapter):
         self._trim_oldest_dict_entries(self._channel_team, self._CHANNEL_TEAM_MAX)
         self._trim_oldest_dict_entries(self._channel_teams, self._CHANNEL_TEAM_MAX)
 
+    def attach_work_router(self, router) -> None:
+        current = getattr(self, "_work_router", None)
+        if current is not None and current is not router:
+            raise RuntimeError("Work Router already attached")
+        if getattr(self, "_work_router_stopping", False):
+            raise RuntimeError("Work Router receiver is fenced")
+        self._work_router = router
+        self._work_router_stopping = False
+        if not hasattr(self, "_work_router_ingress_tasks"):
+            self._work_router_ingress_tasks = set()
+            self._work_router_pending_listeners = set()
+
+    async def recover_work_router_ingress(self) -> None:
+        """Startup hook: confirmed+admitted only; uncertainty stays quarantined."""
+        if self._work_router_stopping:
+            return
+        router = self._work_router
+        task = asyncio.current_task()
+        already_tracked = task in self._work_router_ingress_tasks
+        self._work_router_ingress_tasks.add(task)
+        try:
+            for event_id in router.store.ack_journal.ready():
+                await router.store.ack_journal.promote(
+                    router, event_id, fenced=lambda: self._work_router_stopping)
+        finally:
+            if not already_tracked:
+                self._work_router_ingress_tasks.discard(task)
+
+    async def drain_work_router_ingress(self, timeout=5.0) -> bool:
+        """After detach, before store.close; False retains the fenced open store.
+
+        No cancellation is required: an in-flight wire send may be ambiguous.
+        Runtime must also stop Socket Mode before discarding this adapter.
+        """
+        await asyncio.sleep(0)  # Let Bolt's already-scheduled listener register.
+        current = asyncio.current_task()
+        tasks = self._work_router_ingress_tasks - {current}
+        if tasks:
+            _, pending = await asyncio.wait(tasks, timeout=timeout)
+            if pending:
+                return False
+        return not (self._work_router_ingress_tasks - {current}) and not self._work_router_pending_listeners
+
+    def detach_work_router(self, router) -> None:
+        if getattr(self, "_work_router", None) is not router:
+            raise RuntimeError("Work Router owner mismatch")
+        # Keep a closed admission fence until this receiver is disconnected.
+        self._work_router_stopping = True
+        getattr(self, '_work_router_native_contexts', {}).clear()
+        getattr(self, '_work_router_root_refs', {}).clear()
+
+    def _make_socket_mode_handler(self):
+        if getattr(self, "_work_router", None) is None:
+            return AsyncSocketModeHandler(self._app, self._app_token, proxy=self._proxy_url)
+        adapter = self
+
+        class ObservedSocketModeHandler(AsyncSocketModeHandler):
+            async def handle(handler, client, req):
+                await adapter._observe_socket_ack(client, req, super().handle)
+
+        return ObservedSocketModeHandler(self._app, self._app_token, proxy=self._proxy_url)
+
+    async def _observe_socket_ack(self, client, req, handle) -> None:
+        """Commit canonical receipt BEFORE Bolt or its actual wire send."""
+        router = getattr(self, "_work_router", None)
+        payload = req.payload or {}
+        event = payload.get("event") or {}
+        if router is None or not router.config.owns_channel(
+            event.get("channel", ""), event.get("channel_type", "channel")
+        ) or event.get("type") not in {"message", "app_mention"}:
+            await handle(client, req)
+            return
+        if self._work_router_stopping:
+            raise RuntimeError("Work Router receiver is fenced")
+        canonical = router.canonicalize_slack_event(event, payload)
+        if canonical is None or not req.envelope_id:
+            raise RuntimeError("missing canonical ACK identity")
+        journal = router.store.ack_journal
+        journal.prepare(canonical, req.envelope_id)
+        receipt = _SocketAckReceipt(canonical.event_id, journal=journal)
+        adapter = self
+
+        class AckClient:
+            def __getattr__(self, name):
+                return getattr(client, name)
+
+            async def send_socket_mode_response(self, response):
+                envelope_id = (response.get("envelope_id") if isinstance(response, dict)
+                               else response.envelope_id)
+                if envelope_id != req.envelope_id:
+                    raise RuntimeError("Socket ACK envelope mismatch")
+                async with journal.lock('wire', envelope_id):
+                    if adapter._work_router_stopping:
+                        raise RuntimeError("Work Router receiver is fenced")
+                    if journal.begin_wire(canonical.event_id, envelope_id):
+                        await client.send_socket_mode_response(response)
+                        # Shutdown can fence while the transport is in flight.
+                        # Keep its durable send intent uncertain, not false failure.
+                        if adapter._work_router_stopping:
+                            return
+                        journal.confirm_wire(canonical.event_id, envelope_id)
+                    receipt.success = True
+                    receipt.completed.set()
+                await journal.promote(router, canonical.event_id,
+                                      fenced=lambda: adapter._work_router_stopping)
+
+        token = _socket_ack_receipt.set(receipt)
+        task = asyncio.current_task()
+        self._work_router_ingress_tasks.add(task)
+        try:
+            await handle(AckClient(), req)
+            # Listener middleware records selection BEFORE Bolt schedules its
+            # background task. No timing guess or wait on the listener's ACK.
+            if not receipt.native_selected and not self._work_router_stopping:
+                journal.native(canonical.event_id, False)
+        finally:
+            receipt.completed.set()
+            _socket_ack_receipt.reset(token)
+            self._work_router_ingress_tasks.discard(task)
+
+    async def _apply_work_router_admission(self, event, payload, msg_event) -> SlackAdmissionResult:
+        router = getattr(self, "_work_router", None)
+        if router is None or not router.config.owns_channel(
+            event.get("channel", ""), event.get("channel_type", "channel")
+        ):
+            return SlackAdmissionResult(SlackAdmissionStatus.ALLOW)
+        if getattr(self, "_work_router_stopping", False):
+            return SlackAdmissionResult(SlackAdmissionStatus.FAILED, "router_stopping")
+        canonical = router.canonicalize_slack_event(event, payload)
+        receipt = _socket_ack_receipt.get()
+        if (canonical is None or receipt is None or receipt.journal is None
+                or receipt.event_id != canonical.event_id):
+            return SlackAdmissionResult(SlackAdmissionStatus.FAILED, "missing_ack_identity")
+        try:
+            # Durable admission is safe before ACK but NOT runnable. Never wait
+            # for ACK inside a Bolt listener (process_before_response deadlock).
+            receipt.native_called = True
+            # Current and native-selected root references only. No bytes, URLs,
+            # absolute paths or enriched bodies enter the journal.
+            if event.get("files") or msg_event.media_urls or msg_event.media_types:
+                if not self._retain_work_router_native_context(canonical, event, msg_event):
+                    receipt.journal.native(
+                        canonical.event_id, False, reason="media_context_unavailable")
+                    return SlackAdmissionResult(
+                        SlackAdmissionStatus.FAILED, "media_context_unavailable")
+                receipt.journal.require_native_context(canonical.event_id,
+                    self._work_router_native_reference(canonical.event_id))
+            receipt.journal.native(canonical.event_id, True)
+            await receipt.journal.promote(
+                router, canonical.event_id, fenced=lambda: self._work_router_stopping)
+        except Exception:
+            logger.error("Work Router durable admission failed")
+            return SlackAdmissionResult(SlackAdmissionStatus.FAILED, "durable_enqueue_failed")
+        return SlackAdmissionResult(SlackAdmissionStatus.CONSUMED)
+
     def _start_socket_mode_handler(self) -> None:
         """Start the Slack Socket Mode background task."""
         if not self._app or not self._app_token:
             raise RuntimeError("Socket Mode requires an initialized app and app token")
-        self._handler = AsyncSocketModeHandler(self._app, self._app_token, proxy=self._proxy_url)
+        self._handler = self._make_socket_mode_handler()
         _apply_slack_proxy(self._handler.client, self._proxy_url)
         task = asyncio.create_task(self._handler.start_async())
         self._socket_mode_task = task
@@ -1468,6 +1655,13 @@ class SlackAdapter(BasePlatformAdapter):
 
             return _listener
 
+        async def _select_router_listener(next):
+            receipt = _socket_ack_receipt.get()
+            if receipt is not None and receipt.journal is not None:
+                receipt.native_selected = True
+                self._work_router_pending_listeners.add(id(receipt))
+            await next()
+
         for event_type, handler in (
             ("message", self._handle_slack_message), ("app_mention", self._handle_slack_message),
             ("app_home_opened", self._handle_app_home_opened),
@@ -1477,7 +1671,8 @@ class SlackAdapter(BasePlatformAdapter):
             ("reaction_removed", _reaction(True)),
             ("assistant_thread_started", self._handle_assistant_thread_lifecycle_event),
             ("assistant_thread_context_changed", self._handle_assistant_thread_lifecycle_event)):
-            self._app.event(event_type)(_listener_for(handler))
+            middleware = [_select_router_listener] if event_type in {"message", "app_mention"} else []
+            self._app.event(event_type, middleware=middleware)(_listener_for(handler))
         # Catch-all ack: unacked envelopes count as failures and past 95%/60-min Slack disables
         # Event Subscriptions (ALL inbound). Registered AFTER all named handlers (first match wins).
         # Catch-all no-op ack for any other subscribed event type that Hermes has no listener for (e.g.
@@ -1735,6 +1930,8 @@ class SlackAdapter(BasePlatformAdapter):
     async def disconnect(self) -> None:
         """Disconnect from Slack."""
         self._running = False
+        getattr(self, '_work_router_native_contexts', {}).clear()
+        getattr(self, '_work_router_root_refs', {}).clear()
         # Seal dangling native streams so no live-typing indicator survives a restart.
         for chat_id, stream in list(self._active_streams.items()):
             await self._seal_stream(chat_id, stream)
@@ -2534,7 +2731,8 @@ class SlackAdapter(BasePlatformAdapter):
 
     def _slack_allow_bots(self) -> str:
         """Return normalized Slack bot-message policy."""
-        raw = self.config.extra.get("allow_bots", "") or os.getenv("SLACK_ALLOW_BOTS", "none")
+        # Scoped read: under multiplex os.environ is the DEFAULT profile's bot-admission policy.
+        raw = self.config.extra.get("allow_bots", "") or _get_scoped_secret("SLACK_ALLOW_BOTS", "none")
         value = str(raw).lower().strip()
         if value not in {"none", "mentions", "all"}:
             logger.warning("[Slack] Unknown allow_bots=%r; treating as 'none'", raw)
@@ -2556,7 +2754,7 @@ class SlackAdapter(BasePlatformAdapter):
         if cached is None:
             raw = self.config.extra.get("api_human_users")
             if raw is None:
-                raw = os.getenv("SLACK_API_HUMAN_USERS", "")
+                raw = _get_scoped_secret("SLACK_API_HUMAN_USERS", "")
             parts = raw if isinstance(raw, (list, tuple, set)) else str(raw).split(",")
             cached = self._api_human_users_cache = frozenset(
                 str(p).strip() for p in parts if str(p).strip())
@@ -2655,25 +2853,25 @@ class SlackAdapter(BasePlatformAdapter):
 
     async def send_multiple_images(
         self, chat_id: str, images: List[Tuple[str, str]],
-        metadata: Optional[Dict[str, Any]] = None, human_delay: float = 0.0) -> None:
+        metadata: Optional[Dict[str, Any]] = None, human_delay: float = 0.0) -> SendResult:
         """Send a batch of images as one message via ``files_upload_v2(file_uploads=...)`` (10 per
         call, Slack cap) instead of N posts; falls back to the base per-image loop on failure."""
         if self._suppressed_ignored(chat_id, "multi-image upload in"):
-            return
+            return SendResult(success=False, error="ignored_channel")
         if not self._app:
-            return
+            return SendResult(success=False, error="Not connected")
         if not images:
-            return
+            return SendResult(success=False, error="no images to send")
         chat_id = await self._dm_target(chat_id, metadata)
         try:
             from urllib.parse import unquote as _unquote
             from tools.url_safety import create_ssrf_safe_async_client, is_safe_url as _is_safe_url
         except Exception:
-            await super().send_multiple_images(chat_id, images, metadata, human_delay)
-            return
+            return await super().send_multiple_images(chat_id, images, metadata, human_delay)
         thread_ts = self._resolve_thread_ts(None, metadata)
         CHUNK = 10
         chunks = [images[i : i + CHUNK] for i in range(0, len(images), CHUNK)]
+        delivered = False
         for chunk_idx, chunk in enumerate(chunks):
             if human_delay > 0 and chunk_idx > 0:
                 await asyncio.sleep(human_delay)
@@ -2690,12 +2888,15 @@ class SlackAdapter(BasePlatformAdapter):
                     channel=chat_id, file_uploads=file_uploads, initial_comment=initial_comment,
                     thread_ts=thread_ts)
                 self._record_uploaded_file_thread(chat_id, thread_ts, metadata)
+                delivered = True
             except Exception as e:
                 logger.warning(
                     "[Slack] Multi-image files_upload_v2 failed (chunk %d/%d), falling back to per-image: %s",
                     chunk_idx + 1, len(chunks), e, exc_info=True)
-                await super().send_multiple_images(
+                fallback = await super().send_multiple_images(
                     chat_id, chunk, metadata, human_delay=human_delay)
+                delivered = delivered or fallback.success
+        return SendResult(success=delivered, error=None if delivered else "all images failed to send")
 
     @staticmethod
     async def _collect_image_uploads(
@@ -3991,6 +4192,7 @@ class SlackAdapter(BasePlatformAdapter):
     async def _hydrate_thread_context(
         self, *, channel_id: str, event_thread_ts, ts: str, user_id: str, team_id: str,
         is_thread_reply: bool, is_mentioned: bool, is_dm: bool,
+        context_scope: Optional[dict] = None,
     ) -> Tuple[Optional[str], List[str], List[str]]:
         """``(channel_context, root_media_urls, root_media_types)`` for a thread reply. No session:
         full thread + root images once, set watermark. Session + @mention: delta past watermark
@@ -4023,6 +4225,8 @@ class SlackAdapter(BasePlatformAdapter):
                 **kw)
             if thread_context:
                 channel_context = thread_context
+                if context_scope is not None:
+                    context_scope.update(verified=True, after_ts=kw.get('after_ts'))
 
         watermark_args = dict(
             channel_id=channel_id, thread_ts=event_thread_ts, user_id=user_id, team_id=team_id)
@@ -4084,6 +4288,34 @@ class SlackAdapter(BasePlatformAdapter):
         self._evict_oldest_by_ts(self._reacting_message_ids, self._REACTING_MESSAGE_IDS_MAX)
 
     async def _handle_slack_message(self, event: dict, payload: Optional[dict] = None) -> None:
+        receipt = _socket_ack_receipt.get()
+        if receipt is None or receipt.journal is None:
+            return await self._handle_slack_message_claimed(event, payload)
+        if self._work_router_stopping:
+            self._work_router_pending_listeners.discard(id(receipt))
+            return
+        task = asyncio.current_task()
+        already_tracked = task in self._work_router_ingress_tasks
+        self._work_router_ingress_tasks.add(task)
+        try:
+            async with receipt.journal.lock('native', receipt.event_id):
+                if self._work_router_stopping:
+                    return
+                row = receipt.journal.get(receipt.event_id)
+                if row['native_state'] != 'pending':
+                    await receipt.journal.promote(
+                        self._work_router, receipt.event_id,
+                        fenced=lambda: self._work_router_stopping)
+                    return
+                await self._handle_slack_message_claimed(event, payload)
+                if not receipt.native_called and not self._work_router_stopping:
+                    receipt.journal.native(receipt.event_id, False)
+        finally:
+            self._work_router_pending_listeners.discard(id(receipt))
+            if not already_tracked:
+                self._work_router_ingress_tasks.discard(task)
+
+    async def _handle_slack_message_claimed(self, event: dict, payload: Optional[dict] = None) -> None:
         """Guard around :meth:`_handle_slack_message_impl`: the impl claims the ts early (no second
         turn from a mid-flight unfurl); if THIS call newly claimed it and raises, release the claim
         so a retry/edit can re-drive it. Pre-existing claims stay."""
@@ -4296,12 +4528,13 @@ class SlackAdapter(BasePlatformAdapter):
                 text, original_text, command_probe_text, is_command_text, bot_uid, thread_ts,
                 team_id)
         # Thread history stays out of ``text``: prepending would push a command off char zero.
+        context_scope: dict = {}
         (
             channel_context, thread_root_media_urls, thread_root_media_types,
         ) = await self._hydrate_thread_context(
             channel_id=channel_id, event_thread_ts=event_thread_ts, ts=ts, user_id=user_id,
             team_id=team_id, is_thread_reply=is_thread_reply, is_mentioned=is_mentioned,
-            is_dm=is_dm)
+            is_dm=is_dm, context_scope=context_scope)
         # Thread-root media is delivered ahead of the trigger message's own files.
         media_urls, media_types, text = await self._collect_inbound_media(
             event, channel_id, team_id, text, thread_root_media_urls, thread_root_media_types)
@@ -4310,6 +4543,7 @@ class SlackAdapter(BasePlatformAdapter):
             is_command_text=is_command_text, channel_id=channel_id, team_id=team_id, ts=ts,
             user_id=user_id, thread_ts=thread_ts, is_dm=is_dm, media_urls=media_urls,
             media_types=media_types, channel_context=channel_context)
+        msg_event.metadata['_work_router_context_scope'] = context_scope
         # React only when directly addressed; MPIMs are shared, so they need a
         # mention like any channel.
         if (is_one_to_one_dm or is_mentioned) and self._reactions_enabled():
@@ -4323,7 +4557,200 @@ class SlackAdapter(BasePlatformAdapter):
                 f"{msg_event.text}")
         if ts:
             self._remember_processed_message_ts(ts)
+        admission = await self._apply_work_router_admission(event, payload, msg_event)
+        if admission.status is not SlackAdmissionStatus.ALLOW:
+            if admission.status is SlackAdmissionStatus.FAILED:
+                # The native claim was made before the admission await. Release
+                # it on failure so a Slack retry can reach durable admission.
+                if ts:
+                    self._processed_message_ts.pop(ts, None)
+                event_ts = event.get("_slack_changed_event_ts") or ts
+                self._dedup.discard(self._workspace_event_id(dedup_team_id, event_ts))
+                logger.error("Work Router admission rejected: reason=%s", admission.error)
+            return
         await self.handle_message(msg_event)
+
+    def _retain_work_router_native_context(self, canonical, event, native):
+        import hashlib
+        from pathlib import Path
+        from gateway.platforms.base import (
+            get_image_cache_dir, get_document_cache_dir, validate_media_delivery_path,
+        )
+        refs = event.get('_work_router_collected_refs', ())
+        if (not refs
+                or sum(not ref.get('prior') for ref in refs) != len(event.get('files', ()))
+                or bool(event.get('_work_router_prior_media')) != any(ref.get('prior') for ref in refs)
+                or len(refs) != len(native.media_urls)
+                or len(refs) != len(native.media_types)):
+            return False
+        contexts = getattr(self, '_work_router_native_contexts', None)
+        if contexts is None:
+            contexts = self._work_router_native_contexts = {}
+        if len(contexts) >= 1024:
+            return False
+        roots = {get_image_cache_dir().resolve(), get_document_cache_dir().resolve()}
+        stats = []
+        hashes = []
+        try:
+            for ref, path, mime in zip(refs, native.media_urls, native.media_types):
+                p = Path(path)
+                if (not ref['id'] or ref['path'] != path
+                        or not (mime.startswith('image/') or ref['kind'] == 'document')
+                        or p.is_symlink() or p.resolve().parent not in roots
+                        or validate_media_delivery_path(path) != str(p.resolve())):
+                    return False
+                st = p.stat()
+                stats.append((st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns))
+                with p.open('rb') as stream:
+                    hashes.append(hashlib.file_digest(stream, 'sha256').hexdigest())
+        except (OSError, ValueError):
+            return False
+        from gateway.work_router.ack_journal import AckJournal
+        contexts[canonical.event_id] = {
+            'identity': AckJournal.canonical_payload(canonical)[0],
+            'refs': refs, 'stats': stats, 'roots': roots, 'target': None,
+            'hashes': hashes,
+            'recoverable': True,
+            'text_hash': hashlib.sha256(native.text.encode()).hexdigest(),
+            'context_hash': hashlib.sha256(native.channel_context.encode()).hexdigest()
+                if native.channel_context else None,
+            'context_scope': dict(native.metadata.get('_work_router_context_scope', {})),
+            'text': native.text, 'media_urls': list(native.media_urls),
+            'media_types': list(native.media_types),
+            'media_text_inlined': native.media_text_inlined,
+            'channel_context': native.channel_context, 'message_id': native.message_id,
+        }
+        return True
+
+    def _work_router_native_reference(self, event_id):
+        """Bounded cache references only, never URLs, body text or cache copies."""
+        import hashlib
+        from pathlib import Path
+        item = self._work_router_native_contexts[event_id]
+        return {'identity': hashlib.sha256(item['identity'].encode()).hexdigest(),
+            'roots': sorted(hashlib.sha256(str(root).encode()).hexdigest() for root in item['roots']),
+            'recoverable': item['recoverable'], 'message_id': item['message_id'],
+            'text_hash': item['text_hash'], 'context_hash': item['context_hash'],
+            'context_scope': item['context_scope'],
+            'refs': [{'id': ref['id'], 'kind': ref['kind'], 'prior': bool(ref.get('prior')),
+                'name': Path(path).name, 'display_name': ref.get('name', ''),
+                'mime': mime, 'sha256': digest}
+                for ref, path, mime, digest in zip(item['refs'], item['media_urls'], item['media_types'], item['hashes'])]}
+
+    async def _work_router_media_context(self, event, target):
+        """Reuse one receiving-adapter context for exactly its selected Owner.
+
+        Recovery requires a fully reconstructable reference; missing enrichment,
+        cache or source access fails before Owner execution. No cache retention change.
+        """
+        from pathlib import Path
+        from gateway.platforms.base import validate_media_delivery_path, validate_inbound_media_size, _looks_like_image
+        from gateway.work_router.ack_journal import AckJournal
+        item = getattr(self, '_work_router_native_contexts', {}).get(event.event_id)
+        reconstruct = item is None
+        import hashlib
+        if item is None:
+            from gateway.platforms.base import get_image_cache_dir, get_document_cache_dir
+            ref = event.metadata.get('_native_reference')
+            roots = {get_image_cache_dir().resolve(), get_document_cache_dir().resolve()}
+            identity = AckJournal.canonical_payload(event)[0]
+            if (not isinstance(ref, dict) or ref.get('recoverable') is not True
+                    or ref.get('identity') != hashlib.sha256(identity.encode()).hexdigest()
+                    or ref.get('roots') != sorted(hashlib.sha256(str(root).encode()).hexdigest() for root in roots)
+                    or not isinstance(ref.get('refs'), list) or not 0 < len(ref['refs']) <= 1024):
+                raise RuntimeError('media_context_unavailable')
+            paths, mimes, refs, hashes, stats = [], [], [], [], []
+            for entry in ref['refs']:
+                name = entry['name']
+                if not name or Path(name).name != name or name in {'.', '..'}:
+                    raise RuntimeError('media_cache_unavailable')
+                root = get_image_cache_dir() if entry['kind'] == 'image' else get_document_cache_dir()
+                path = root / name
+                paths.append(str(path)); mimes.append(entry['mime'])
+                refs.append({'id': entry['id'], 'kind': entry['kind'], 'prior': entry['prior'],
+                             'name': entry.get('display_name', '')})
+                hashes.append(entry['sha256'])
+                st = path.stat()
+                stats.append((st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns))
+            item = {'identity': identity, 'roots': roots, 'target': None,
+                'refs': refs, 'hashes': hashes, 'stats': stats,
+                'text': event.text, 'media_urls': paths, 'media_types': mimes,
+                'media_text_inlined': [], 'channel_context': None, 'message_id': ref['message_id'],
+                'text_hash': ref.get('text_hash'), 'context_hash': ref.get('context_hash'),
+                'context_scope': ref.get('context_scope', {})}
+        if (not item or item['identity'] != AckJournal.canonical_payload(event)[0]
+                or item['target'] not in (None, target)):
+            raise RuntimeError('media_context_unavailable')
+        item['target'] = target
+        for ref, expected, path, mime, digest in zip(item['refs'], item['stats'], item['media_urls'], item['media_types'], item['hashes']):
+            # Existing authenticated native files.info boundary; never re-fetch bytes.
+            client = self._team_clients.get(event.metadata.get('slack_team_id'))
+            if client is None:
+                raise RuntimeError('media_receiving_team_unavailable')
+            try:
+                response = await client.files_info(file=ref['id'])
+                info = response.get('file') if response.get('ok') is True else None
+            except Exception:
+                raise RuntimeError('media_source_unavailable') from None
+            if (not info or info.get('id') != ref['id']
+                    or info.get('is_deleted') or info.get('file_access') == 'check_file_info'
+                    or not (info.get('url_private_download') or info.get('url_private'))):
+                raise RuntimeError('media_source_unavailable')
+            p = Path(path)
+            if (p.is_symlink() or p.resolve().parent not in item['roots']
+                    or validate_media_delivery_path(path) != str(p.resolve())):
+                raise RuntimeError('media_cache_unavailable')
+            with p.open('rb') as stream:
+                st = os.fstat(stream.fileno())
+                if (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns) != expected:
+                    raise RuntimeError('media_cache_changed')
+                validate_inbound_media_size(st.st_size, media_type=ref['kind'])
+                if mime.startswith('image/') and not _looks_like_image(stream.read(12)):
+                    raise RuntimeError('media_cache_invalid')
+                stream.seek(0)
+                if hashlib.file_digest(stream, 'sha256').hexdigest() != digest:
+                    raise RuntimeError('media_cache_changed')
+        if reconstruct:
+            # Rebuild only through the native text/authorized thread seams. Store
+            # hashes, not an extra durable copy of document or conversation text.
+            text = event.text
+            for source_ref, path, mime in zip(item['refs'], item['media_urls'], item['media_types']):
+                if source_ref['kind'] != 'document':
+                    continue
+                name = source_ref.get('name', '')
+                ext = os.path.splitext(name)[1].lower()
+                if (ext in _TEXT_INJECT_EXTENSIONS or mime.startswith('text/')) and Path(path).stat().st_size <= 100 * 1024:
+                    try:
+                        body = Path(path).read_bytes().decode('utf-8')
+                    except UnicodeDecodeError:
+                        continue
+                    display = re.sub(r'[^\w.\- ]', '_', name or f'document{ext or ".txt"}')
+                    text = f'[Content of {display}]:\n{body}\n\n{text}' if text else f'[Content of {display}]:\n{body}'
+            text = await self._humanize_user_mentions(
+                text, chat_id=event.channel_id, team_id=event.metadata.get('slack_team_id', ''))
+            if item['text_hash'] and hashlib.sha256(text.encode()).hexdigest() != item['text_hash']:
+                raise RuntimeError('media_context_unavailable')
+            item['text'] = text
+            if item['context_hash']:
+                scope = item['context_scope']
+                if not isinstance(scope, dict) or scope.get('verified') is not True:
+                    raise RuntimeError('media_context_unavailable')
+                selection = {'after_ts': scope['after_ts']} if scope.get('after_ts') is not None else {}
+                context = await self._fetch_thread_context(
+                    channel_id=event.channel_id, thread_ts=event.thread_ts,
+                    current_ts=item['message_id'], team_id=event.metadata.get('slack_team_id', ''),
+                    force_refresh=True, **selection)
+                if not context or hashlib.sha256(context.encode()).hexdigest() != item['context_hash']:
+                    raise RuntimeError('media_context_unavailable')
+                item['channel_context'] = context
+        contexts = getattr(self, '_work_router_native_contexts', None)
+        if contexts is None:
+            contexts = self._work_router_native_contexts = {}
+        if event.event_id not in contexts and len(contexts) >= 1024:
+            raise RuntimeError('media_context_unavailable')
+        contexts[event.event_id] = item
+        return {k: item[k] for k in ('text', 'media_urls', 'media_types',
+                'media_text_inlined', 'channel_context', 'message_id')}
 
     async def _build_message_event(
         self, event: dict, *, text: str, original_text: str, command_probe_text: str,
@@ -4492,6 +4919,14 @@ class SlackAdapter(BasePlatformAdapter):
         decode — PDF/zip headers decode). Failures are prepended as an attachment notice."""
         media_urls = list(thread_root_media_urls)
         media_types = list(thread_root_media_types)
+        # Overwrite any untrusted inbound lookalike; provenance is native-only.
+        event['_work_router_collected_refs'] = []
+        event['_work_router_prior_media'] = bool(thread_root_media_urls or thread_root_media_types)
+        root_refs = getattr(self, '_work_router_root_refs', {})
+        for path in thread_root_media_urls:
+            ref = root_refs.pop(path, None)
+            if ref and ref['source'] == (channel_id, event.get('thread_ts'), team_id):
+                event['_work_router_collected_refs'].append(ref)
         notices: List[str] = []
         for f in event.get("files", []):
             if f.get("file_access") == "check_file_info":
@@ -4508,6 +4943,9 @@ class SlackAdapter(BasePlatformAdapter):
                 if cached is None:
                     continue
                 cached_path, media_type, injection = cached
+                event['_work_router_collected_refs'].append({
+                    'id': f.get('id'), 'url': url, 'path': cached_path, 'kind': kind,
+                    'name': f.get('name', '')})
                 media_urls.append(cached_path)
                 media_types.append(media_type)
                 if injection:
@@ -5627,6 +6065,14 @@ class SlackAdapter(BasePlatformAdapter):
                         "image", f, url, mimetype, team_id)
                     media_urls.append(cached_path)
                     media_types.append(media_type)
+                    if getattr(self, '_work_router', None) is not None:
+                        refs = getattr(self, '_work_router_root_refs', None)
+                        if refs is None:
+                            refs = self._work_router_root_refs = {}
+                        if len(refs) < 1024:
+                            refs[cached_path] = {'id': f.get('id'), 'path': cached_path,
+                                'kind': 'image', 'prior': True, 'url': url,
+                                'source': (channel_id, thread_ts, team_id)}
                 except Exception as exc:
                     logger.warning(
                         "[Slack] Failed to cache thread-root image %s: %s",
