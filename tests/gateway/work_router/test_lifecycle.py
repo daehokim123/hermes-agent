@@ -34,6 +34,41 @@ def test_enabled_without_native_sender_refuses_before_opening_store(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_runtime_uses_profile_scoped_merged_config(tmp_path, monkeypatch):
+    ambient = tmp_path / "ambient"
+    profile = tmp_path / "profile"
+    managed = tmp_path / "managed"
+    config_at(ambient)
+    config_at(profile)
+    managed.mkdir()
+    profile_raw = yaml.safe_load((profile / "config.yaml").read_text())
+    profile_raw["work_router"]["db_path"] = "${ROUTER_PROFILE_DB}"
+    (profile / "config.yaml").write_text(yaml.safe_dump(profile_raw))
+    (managed / "config.yaml").write_text(
+        yaml.safe_dump({"work_router": {"channel_allowlist": ["CMANAGED"]}})
+    )
+    profile_db = profile / "profile-router.db"
+    monkeypatch.setenv("HERMES_HOME", str(ambient))
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    monkeypatch.setenv("ROUTER_PROFILE_DB", str(profile_db))
+    from hermes_cli import managed_scope
+    from hermes_cli import config as config_mod
+    from hermes_constants import get_hermes_home
+
+    config_mod._LOAD_CONFIG_CACHE.clear()
+    managed_scope.invalidate_managed_cache()
+    runner = SimpleNamespace()
+    runtime = integration.ensure_runtime(runner, profile_home=profile)
+    assert runtime is not None
+    try:
+        assert runtime.router.config.db_path == profile_db
+        assert runtime.router.config.channel_allowlist == ("CMANAGED",)
+        assert get_hermes_home() == ambient
+    finally:
+        await runtime.stop()
+
+
+@pytest.mark.asyncio
 async def test_stop_fences_all_receivers_waits_children_and_closes_once(tmp_path):
     runtime = integration.RouterRuntime(config_at(tmp_path), sender=AsyncMock())
     first = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-test"))

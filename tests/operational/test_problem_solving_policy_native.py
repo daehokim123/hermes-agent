@@ -18,14 +18,19 @@ def helper():
     return mod
 
 
-@pytest.mark.parametrize('role', ROLES)
-def test_native_full_contract_exactly_once_per_role(tmp_path, monkeypatch, role):
+@pytest.fixture
+def assembler(tmp_path, monkeypatch):
     mod = helper()
-    # Keep actual native context evidence under the approved TSK62 root: the
-    # canonical runner removes pytest tmp directories after each file.
-    import tempfile
-    evidence = Path(tempfile.mkdtemp(prefix='policy-native-', dir=mod.EVIDENCE_ROOT))
-    target = evidence / role
+    evidence_root = tmp_path / 'evidence'
+    evidence_root.mkdir()
+    monkeypatch.setattr(mod, 'EVIDENCE_ROOT', evidence_root)
+    return mod
+
+
+@pytest.mark.parametrize('role', ROLES)
+def test_native_full_contract_exactly_once_per_role(assembler, monkeypatch, role):
+    mod = assembler
+    target = mod.EVIDENCE_ROOT / role
     mod.materialize(ROOT, role, target)
     monkeypatch.setenv('HERMES_HOME', str(target))
     monkeypatch.chdir(target)
@@ -51,9 +56,9 @@ def test_pointer_alone_does_not_load_contract(tmp_path, monkeypatch):
     assert 'TSK63-CANONICAL-BEGIN' not in result
 
 
-def test_native_truncation_fails_closed(tmp_path, monkeypatch):
-    mod = helper()
-    target = tmp_path / 'hans'
+def test_native_truncation_fails_closed(assembler, monkeypatch):
+    mod = assembler
+    target = mod.EVIDENCE_ROOT / 'hans'
     mod.materialize(ROOT, 'hans', target)
     monkeypatch.setenv('HERMES_HOME', str(target))
     monkeypatch.setattr(prompt_builder, 'get_hermes_home', lambda: target)
@@ -62,9 +67,9 @@ def test_native_truncation_fails_closed(tmp_path, monkeypatch):
         mod.verify_native(ROOT, 'hans', target)
 
 
-def test_higher_priority_context_fails_closed(tmp_path, monkeypatch):
-    mod = helper()
-    target = tmp_path / 'mason'
+def test_higher_priority_context_fails_closed(assembler, monkeypatch):
+    mod = assembler
+    target = mod.EVIDENCE_ROOT / 'mason'
     mod.materialize(ROOT, 'mason', target)
     (target / '.hermes.md').write_text('Higher priority project context')
     monkeypatch.setenv('HERMES_HOME', str(target))
@@ -73,9 +78,9 @@ def test_higher_priority_context_fails_closed(tmp_path, monkeypatch):
         mod.verify_native(ROOT, 'mason', target)
 
 
-def test_existing_target_is_never_overwritten(tmp_path):
-    mod = helper()
-    path = tmp_path / 'existing'
+def test_existing_target_is_never_overwritten(assembler):
+    mod = assembler
+    path = mod.EVIDENCE_ROOT / 'existing'
     path.mkdir()
     (path / 'SOUL.md').write_text('keep')
     with pytest.raises(FileExistsError):
@@ -90,25 +95,25 @@ def test_existing_target_is_never_overwritten(tmp_path):
     '/opt/data/cache/problem-solving-policy-9ufby77a/tsk62-candidate',
     '/opt/data/cache/tsk62-v0212-development-hfr6lbjs',
 ])
-def test_materialization_rejects_non_evidence_destinations(target):
+def test_materialization_rejects_non_evidence_destinations(assembler, target):
     with pytest.raises(ValueError, match='evidence root'):
-        helper().materialize(ROOT, 'hans', Path(target))
+        assembler.materialize(ROOT, 'hans', Path(target))
 
 
-def test_symlink_escape_and_target_traversal_rejected(tmp_path):
-    mod = helper()
-    link = tmp_path / 'escape'
+def test_symlink_escape_and_target_traversal_rejected(assembler):
+    mod = assembler
+    link = mod.EVIDENCE_ROOT / 'escape'
     link.symlink_to('/opt/hermes', target_is_directory=True)
     with pytest.raises(ValueError, match='evidence root'):
         mod.materialize(ROOT, 'hans', link / 'tsk63-candidate')
     with pytest.raises(ValueError, match='traversal'):
-        mod.materialize(ROOT, 'hans', tmp_path / 'unused' / '..' / 'candidate')
+        mod.materialize(ROOT, 'hans', mod.EVIDENCE_ROOT / 'unused' / '..' / 'candidate')
 
 
 @pytest.mark.parametrize('name', ['.hermes.md', 'HERMES.md', 'AGENTS.override.md'])
-def test_selected_higher_priority_source_is_preserved_and_observed(tmp_path, monkeypatch, name):
-    mod = helper()
-    target = mod.materialize(ROOT, 'hans', tmp_path / 'hans')
+def test_selected_higher_priority_source_is_preserved_and_observed(assembler, monkeypatch, name):
+    mod = assembler
+    target = mod.materialize(ROOT, 'hans', mod.EVIDENCE_ROOT / 'hans')
     selected = target / name
     selected.write_text('Preserve higher priority source')
     monkeypatch.setenv('HERMES_HOME', str(target))
@@ -118,9 +123,9 @@ def test_selected_higher_priority_source_is_preserved_and_observed(tmp_path, mon
     assert selected.read_text() == 'Preserve higher priority source'
 
 
-def test_duplicate_contract_fails_closed(tmp_path, monkeypatch):
-    mod = helper()
-    target = mod.materialize(ROOT, 'hans', tmp_path / 'hans')
+def test_duplicate_contract_fails_closed(assembler, monkeypatch):
+    mod = assembler
+    target = mod.materialize(ROOT, 'hans', mod.EVIDENCE_ROOT / 'hans')
     canonical = (ROOT / 'operations/docs/ai-problem-solving-policy.md').read_text()
     with (target / 'AGENTS.md').open('a') as stream:
         stream.write('\n' + canonical)
@@ -129,9 +134,9 @@ def test_duplicate_contract_fails_closed(tmp_path, monkeypatch):
         mod.verify_native(ROOT, 'hans', target)
 
 
-def test_source_soul_bytes_preserved(tmp_path, monkeypatch):
-    mod = helper()
-    target = mod.materialize(ROOT, 'hans', tmp_path / 'hans')
+def test_source_soul_bytes_preserved(assembler, monkeypatch):
+    mod = assembler
+    target = mod.materialize(ROOT, 'hans', mod.EVIDENCE_ROOT / 'hans')
     source = ROOT / 'operations/agents/hans/SOUL.md'
     assert (target / 'SOUL.md').read_bytes() == source.read_bytes()
     with (target / 'SOUL.md').open('a') as stream:
@@ -141,20 +146,20 @@ def test_source_soul_bytes_preserved(tmp_path, monkeypatch):
         mod.verify_native(ROOT, 'hans', target)
 
 
-def test_missing_home_rejected_without_native_initialization(tmp_path, monkeypatch):
-    mod = helper()
-    target = mod.materialize(ROOT, 'hans', tmp_path / 'hans')
+def test_missing_home_rejected_without_native_initialization(assembler, monkeypatch):
+    mod = assembler
+    target = mod.materialize(ROOT, 'hans', mod.EVIDENCE_ROOT / 'hans')
     monkeypatch.delenv('HERMES_HOME', raising=False)
     with pytest.raises(ValueError, match='HERMES_HOME'):
         mod.verify_native(ROOT, 'hans', target)
 
 
-def test_unknown_role_and_live_home_are_rejected(tmp_path, monkeypatch):
-    mod = helper()
+def test_unknown_role_and_live_home_are_rejected(assembler, monkeypatch):
+    mod = assembler
     with pytest.raises(ValueError, match='role'):
-        mod.materialize(ROOT, '../hans', tmp_path / 'bad')
-    target = tmp_path / 'hans'
+        mod.materialize(ROOT, '../hans', mod.EVIDENCE_ROOT / 'bad')
+    target = mod.EVIDENCE_ROOT / 'hans'
     mod.materialize(ROOT, 'hans', target)
-    monkeypatch.setenv('HERMES_HOME', str(tmp_path / 'unrelated'))
+    monkeypatch.setenv('HERMES_HOME', str(mod.EVIDENCE_ROOT / 'unrelated'))
     with pytest.raises(ValueError, match='HERMES_HOME'):
         mod.verify_native(ROOT, 'hans', target)
