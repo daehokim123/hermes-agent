@@ -10,6 +10,7 @@ tests/docker/test_container_restart.py.
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -126,6 +127,76 @@ def test_running_profile_is_registered_and_autostarted(tmp_path: Path) -> None:
     assert (svc / "type").read_text().strip() == "longrun"
     # Auto-start means no down-marker.
     assert not (svc / "down").exists()
+
+
+def test_legacy_gateway_run_starts_missing_state_sibling_profiles(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scandir = tmp_path / "run-service"
+    scandir.mkdir()
+    siblings = ("hans", "wendy", "tesla", "turing", "mason", "watson")
+    for name in siblings:
+        _make_profile(tmp_path, name, state=None)
+    _make_profile(tmp_path, "paused", state="stopped")
+    _make_profile(tmp_path, "failed", state="startup_failed")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    actions = reconcile_profile_gateways(
+        hermes_home=tmp_path,
+        scandir=scandir,
+        container_argv=("/opt/hermes/docker/main-wrapper.sh", "gateway", "run"),
+    )
+
+    by_profile = {action.profile: action for action in actions}
+    assert set(by_profile) == {"default", *siblings, "failed", "paused"}
+    assert by_profile["default"].action == "started"
+    assert all(by_profile[name].action == "started" for name in siblings)
+    assert by_profile["failed"].action == "registered"
+    assert by_profile["paused"].action == "registered"
+    assert len(list(scandir.glob("gateway-default"))) == 1
+    for name in siblings:
+        service = scandir / f"gateway-{name}"
+        assert not (service / "down").exists()
+        run_script = (service / "run").read_text(encoding="utf-8")
+        assert f"hermes --profile {name} gateway run --replace" in run_script
+        assert "TOKEN" not in run_script and "SECRET" not in run_script
+    assert (scandir / "gateway-paused" / "down").exists()
+    assert (scandir / "gateway-failed" / "down").exists()
+
+    _make_profile(tmp_path, "no_supervise", state=None)
+    monkeypatch.setenv("HERMES_GATEWAY_NO_SUPERVISE", "true")
+    reconcile_profile_gateways(
+        hermes_home=tmp_path,
+        scandir=scandir,
+        container_argv=("/opt/hermes/docker/main-wrapper.sh", "gateway", "run"),
+    )
+    assert (scandir / "gateway-no_supervise" / "down").exists()
+
+
+def test_legacy_gateway_reconcile_add_remove_is_idempotent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scandir = tmp_path / "run-service"
+    scandir.mkdir()
+    alpha = _make_profile(tmp_path, "alpha", state=None)
+    beta = _make_profile(tmp_path, "beta", state=None)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    argv = ("/opt/hermes/docker/main-wrapper.sh", "gateway", "run")
+
+    reconcile_profile_gateways(hermes_home=tmp_path, scandir=scandir, container_argv=argv)
+    first_alpha = (scandir / "gateway-alpha" / "run").read_bytes()
+    shutil.rmtree(beta)
+    _make_profile(tmp_path, "gamma", state=None)
+    reconcile_profile_gateways(hermes_home=tmp_path, scandir=scandir, container_argv=argv)
+
+    assert (scandir / "gateway-alpha" / "run").read_bytes() == first_alpha
+    assert not (scandir / "gateway-alpha" / "down").exists()
+    assert not (scandir / "gateway-gamma" / "down").exists()
+    assert not (scandir / "gateway-beta").exists()
+    assert not list(scandir.glob(".*.tmp"))
+    assert alpha.is_dir()
 
 
 @pytest.mark.parametrize(

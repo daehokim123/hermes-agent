@@ -15,10 +15,11 @@ from typing import Literal, Sequence
 
 log = logging.getLogger(__name__)
 
-# Only this desired state auto-restarts; everything else (startup_failed, starting, stopped,
-# missing) registers the slot down and waits for the user — no crash-loop of a broken gateway
-# across `docker restart`. Older installs only have gateway_state; newer lifecycle commands
-# persist desired_state separately so a transient runtime state can't erase operator intent.
+# Only this desired state auto-restarts; startup_failed, starting, and stopped register the slot
+# down and wait for the user — no crash-loop of a broken gateway across `docker restart`. Missing
+# state also stays down except when a legacy container-level `gateway run` supplies the initial
+# multi-profile run intent. Older installs only have gateway_state; newer lifecycle commands persist
+# desired_state separately so a transient runtime state can't erase operator intent.
 _AUTOSTART_STATES = frozenset({"running"})
 # Transient sub-states of a RUNNING gateway (not an operator stop, not a failed boot). A gateway
 # hard-killed in one of them with no `desired_state` would otherwise stay DOWN on every later boot
@@ -89,8 +90,18 @@ def reconcile_profile_gateways(
         multiplex_profiles = is_truthy_value(os.environ.get("GATEWAY_MULTIPLEX_PROFILES"))
 
     # A legacy `gateway run` container with no state yet seeds `running` (pre-s6 behavior).
+    # The same invocation owned every configured profile gateway in the pre-s6 Sinclair runtime,
+    # so real named profiles with no explicit lifecycle state inherit that one-time run intent.
+    # Explicit stopped/failed state and multiplex ownership still win below.
+    resolved_container_argv = (
+        tuple(container_argv) if container_argv is not None else _read_container_argv()
+    )
+    legacy_gateway_run = (
+        _is_legacy_gateway_run_request(resolved_container_argv)
+        and not is_truthy_value(os.environ.get("HERMES_GATEWAY_NO_SUPERVISE"))
+    )
     legacy_default_state = _maybe_migrate_legacy_gateway_run_state(
-        hermes_home, container_argv=container_argv, dry_run=dry_run)
+        hermes_home, container_argv=resolved_container_argv, dry_run=dry_run)
     default_prior_state = legacy_default_state or _read_desired_state(hermes_home)
     default_should_start = default_prior_state in _AUTOSTART_STATES
     if not dry_run:
@@ -98,6 +109,7 @@ def reconcile_profile_gateways(
         _register_service(scandir, "default", start=default_should_start)
     actions.append(_slot_action("default", hermes_home, default_prior_state, default_should_start))
 
+    profile_entries: list[Path] = []
     profiles_root = hermes_home / "profiles"
     if profiles_root.is_dir():
         for entry in sorted(profiles_root.iterdir()):
@@ -109,13 +121,23 @@ def reconcile_profile_gateways(
                 log.warning("profiles/default/ exists — skipping to avoid colliding with the "
                             "reserved root-profile s6 slot")
                 continue
+            profile_entries.append(entry)
 
-            prior_state = _read_desired_state(entry)
-            should_start = not multiplex_profiles and prior_state in _AUTOSTART_STATES
-            if not dry_run:
-                _cleanup_stale_runtime_files(entry)
-                _register_service(scandir, entry.name, start=should_start)
-            actions.append(_slot_action(entry.name, entry, prior_state, should_start))
+    if not dry_run:
+        _remove_stale_service_slots(scandir, {"default", *(entry.name for entry in profile_entries)})
+    legacy_start_missing = (
+        legacy_gateway_run and default_prior_state in _AUTOSTART_STATES
+    )
+    for entry in profile_entries:
+        prior_state = _read_desired_state(entry)
+        should_start = not multiplex_profiles and (
+            prior_state in _AUTOSTART_STATES
+            or (prior_state is None and legacy_start_missing)
+        )
+        if not dry_run:
+            _cleanup_stale_runtime_files(entry)
+            _register_service(scandir, entry.name, start=should_start)
+        actions.append(_slot_action(entry.name, entry, prior_state, should_start))
     if not dry_run:
         _write_reconcile_log(hermes_home, actions)
     return actions
@@ -226,6 +248,24 @@ def _cleanup_stale_runtime_files(profile_dir: Path) -> None:
     """Remove PID-namespace-bound runtime files that would confuse the new gateway's checks."""
     for name in _STALE_RUNTIME_FILES:
         (profile_dir / name).unlink(missing_ok=True)
+
+
+def _remove_stale_service_slots(scandir: Path, expected_profiles: set[str]) -> None:
+    """Drop boot-time dynamic slots whose persistent profile no longer exists.
+
+    ``container_boot`` runs before s6-svscan starts user services, so removing these tmpfs slots
+    cannot terminate a live gateway. Runtime profile deletion continues to use S6ServiceManager.
+    """
+    import shutil
+
+    for service in scandir.glob("gateway-*"):
+        profile = service.name.removeprefix("gateway-")
+        if profile in expected_profiles:
+            continue
+        if service.is_symlink() or not service.is_dir():
+            service.unlink(missing_ok=True)
+        else:
+            shutil.rmtree(service)
 
 
 def _read_prior_exit_label(profile_dir: Path) -> str:
