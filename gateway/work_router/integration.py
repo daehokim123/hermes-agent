@@ -9,8 +9,6 @@ import asyncio
 import logging
 from pathlib import Path
 
-import yaml
-
 from hermes_constants import get_hermes_home
 from .config import RouterConfig
 from .service import WorkRouter
@@ -117,7 +115,7 @@ class RouterRuntime:
 def ensure_runtime(runner, *, profile_home=None):
     """Called before receiver creation, and in the secondary profile scope.
 
-    Each profile reads ONLY its own raw YAML; no default-profile inheritance.
+    Each profile reads its own canonical merged config; no default-profile inheritance.
     Reconnect reuses the same owner, store and worker rather than reconstructing.
     """
     home = Path(profile_home or get_hermes_home()).resolve()
@@ -126,11 +124,15 @@ def ensure_runtime(runner, *, profile_home=None):
         runtimes = runner._work_router_runtimes = {}
     if home in runtimes:
         return runtimes[home]
-    path = home / "config.yaml"
-    if not path.exists():
-        return None
-    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    config = RouterConfig.from_mapping(raw.get("work_router"))
+    from hermes_cli.config import load_config_readonly
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    home_token = set_hermes_home_override(str(home))
+    try:
+        merged = load_config_readonly()
+    finally:
+        reset_hermes_home_override(home_token)
+    config = RouterConfig.from_mapping(merged.get("work_router"))
     if not config.enabled:
         return None
     config.require_ready()  # Misconfigured opt-in must never silently bypass admission.
