@@ -11,8 +11,9 @@
 # wiped on every container restart. Profile directories under
 # $HERMES_HOME/profiles/ live on the persistent VOLUME. This script
 # walks the persistent profiles, recreates the s6 service slots,
-# and auto-starts only those whose last recorded state was
-# `running` — see hermes_cli/container_boot.py.
+# and auto-starts those whose last recorded state was `running`, plus
+# state-less real profiles under a legacy container-level `gateway run`.
+# See hermes_cli/container_boot.py.
 #
 # Phase 4 also needs hermes-user writes to /run/service/ (so the
 # profile create/delete hooks can register/unregister at runtime),

@@ -4,7 +4,8 @@ The s6 dynamic scandir at /run/service/ lives on tmpfs and is wiped
 on every container restart. Phase 4 Task 4.0's container_boot module
 + cont-init.d/02-reconcile-profiles regenerate the service slots from
 $HERMES_HOME/profiles/<name>/gateway_state.json on every boot and
-auto-start only those whose last state was `running`.
+auto-start profiles with a persisted `running` intent, plus state-less
+real profiles when the container itself was launched as `gateway run`.
 
 These tests stand up a container with a named volume, create profiles
 inside it in various gateway states, restart the container, and
